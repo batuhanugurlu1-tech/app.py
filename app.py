@@ -105,7 +105,7 @@ def main():
         
         st.markdown("### `[2. STRATEJİ KURALLARI]`")
         fast_ema = st.slider("Hızlı EMA (Trend Girişi)", min_value=5, max_value=50, value=9)
-        slow_ema = st.slider("Yavaş EMA (Ana Trend)", min_value=20, max_value=200, value=21)
+        slow_ema = st.slider("Yavaş EMA (Ana Trend)", min_value=10, max_value=200, value=21)
         trade_count = st.number_input("Hedef İşlem Sayısı", min_value=5, max_value=100, value=20)
         
         st.divider()
