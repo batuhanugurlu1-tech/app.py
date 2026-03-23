@@ -25,7 +25,8 @@ st.markdown("""
 # TEKNİK ANALİZ MOTORU
 # ==========================================
 def calculate_indicators(df, fast_ema, slow_ema, is_trend_check=False):
-    if df.empty: return df
+    if df.empty or len(df) < (200 if is_trend_check else slow_ema): 
+        return df
     
     # EMA Hesaplamaları
     df[f'EMA_{fast_ema}'] = df['Close'].ewm(span=fast_ema, adjust=False).mean()
@@ -68,7 +69,12 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
     df_1h_trend = df_1h[['EMA_200_Trend']].rename(columns={'EMA_200_Trend': 'BIG_BROTHER_TREND'})
     df_combined = df_15m.join(df_1h_trend, how='left').ffill()
 
-    for i in range(max(200, slow_ema), len(df_combined)):
+    # Başlangıç indeksini belirle
+    start_idx = max(200, slow_ema)
+    if len(df_combined) <= start_idx:
+        return pd.DataFrame()
+
+    for i in range(start_idx, len(df_combined)):
         if len(trades) >= target_trades: break
         c, p = df_combined.iloc[i], df_combined.iloc[i-1]
 
@@ -94,7 +100,7 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
                 if p_type == "LONG": current_sl = max(current_sl, entry_p)
                 else: current_sl = min(current_sl, entry_p)
 
-            # 2. ERKEN ÇIKIŞ (Scalper Logic): Trend terse dönerse kârı al
+            # 2. ERKEN ÇIKIŞ (Scalper Logic)
             if use_early_exit:
                 if p_type == "LONG" and c[e_f] < c[e_s]:
                     res, exit_p = "SCALP/EXIT", c['Close']
@@ -149,25 +155,33 @@ def main():
 
     if btn:
         try:
-            with st.spinner("Piyasa taranıyor..."):
+            with st.spinner("Piyasa verileri taranıyor..."):
                 df_15m = yf.download(sym, period="60d", interval="15m", progress=False)
                 df_1h = yf.download(sym, period="730d", interval="1h", progress=False)
+                
                 if isinstance(df_15m.columns, pd.MultiIndex): df_15m.columns = df_15m.columns.droplevel(1)
                 if isinstance(df_1h.columns, pd.MultiIndex): df_1h.columns = df_1h.columns.droplevel(1)
+                
                 df_15m.dropna(inplace=True); df_1h.dropna(inplace=True)
                 
+                if df_15m.empty or df_1h.empty:
+                    st.error("Veri alınamadı. Lütfen varlığı değiştirin.")
+                    return
+
                 df_15m = calculate_indicators(df_15m, f_ema, s_ema)
                 df_1h = calculate_indicators(df_1h, 5, 200, is_trend_check=True)
 
                 results = run_elite_backtest(df_15m, df_1h, 20, f_ema, s_ema, adx_t, use_mtf, ts_factor, tp_mult, be_trig, use_exit)
 
-                if not results.empty:
-                    # İstatistikler
+                if results is not None and not results.empty:
                     wins = len(results[results['Result']=='WIN'])
                     scalps = len(results[results['Result']=='SCALP/EXIT'])
                     pos_trades = results[results['PnL_%'] > 0]
                     total_pnl = results['PnL_%'].sum()
-                    profit_factor = abs(results[results['PnL_%'] > 0]['PnL_%'].sum() / results[results['PnL_%'] < 0]['PnL_%'].sum()) if len(results[results['PnL_%'] < 0]) > 0 else 0
+                    
+                    # Profit Factor hesaplama
+                    neg_pnl = results[results['PnL_%'] < 0]['PnL_%'].sum()
+                    profit_factor = abs(results[results['PnL_%'] > 0]['PnL_%'].sum() / neg_pnl) if neg_pnl != 0 else 0
                     
                     st.markdown("### `[SCALPER PERFORMANS ANALİZİ]`")
                     c1, c2, c3, c4 = st.columns(4)
@@ -176,7 +190,6 @@ def main():
                     c3.metric("Erken Hasat (Scalp)", scalps)
                     c4.metric("Profit Factor", f"{profit_factor:.2f}")
 
-                    # Kümülatif Kâr Grafiği
                     results['Cum_PnL'] = results['PnL_%'].cumsum()
                     fig = go.Figure(go.Scatter(x=results['Date'], y=results['Cum_PnL'], line=dict(color='#00FF41', width=3), fill='tozeroy'))
                     fig.update_layout(title=f"{sym} Kâr Eğrisi", template="plotly_dark", height=300)
@@ -184,9 +197,9 @@ def main():
                     
                     st.dataframe(results.tail(15))
                 else:
-                    st.warning("Trend bulunamadı. Ayarları gevşetebilirsiniz.")
+                    st.warning("Bu ayarlarla geçmişte uygun işlem bulunamadı. Lütfen ADX veya EMA değerlerini gevşetin.")
         except Exception as e:
-            st.error(f"Hata: {e}")
+            st.error(f"Sistem Hatası: {e}")
 
 if __name__ == "__main__":
     main()
