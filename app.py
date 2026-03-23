@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 # ==========================================
 # UI YAPILANDIRMASI
 # ==========================================
-st.set_page_config(page_title="QUANT LAB V6.3 // NVDA SHIELD", layout="wide")
+st.set_page_config(page_title="QUANT LAB V6.4 // PROFIT HARVESTER", layout="wide")
 
 st.markdown("""
     <style>
@@ -16,10 +16,7 @@ st.markdown("""
         background-color: #00FF41 !important; color: #0A0A0A !important; 
         font-weight: bold; width: 100%; border-radius: 8px; height: 3.5em; border: none;
     }
-    .signal-card {
-        padding: 20px; border-radius: 15px; text-align: center; margin-bottom: 25px;
-        font-weight: bold; font-size: 1.2em; border: 2px solid #333;
-    }
+    .stMetric { background-color: #1A1D23; border: 1px solid #333; border-radius: 10px; padding: 15px; }
     h1, h2, h3 { color: #00FF41 !important; }
     </style>
 """, unsafe_allow_html=True)
@@ -57,9 +54,9 @@ def calculate_indicators(df, fast_ema, slow_ema, is_trend_check=False):
     return df
 
 # ==========================================
-# ELITE BACKTEST MOTORU (TRAILING STOP)
+# BACKTEST MOTORU (V6.4 - PROFIT HARVESTER)
 # ==========================================
-def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_threshold, use_mtf, trailing_factor=2.0):
+def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_threshold, use_mtf, trailing_factor, tp_multiplier, be_trigger):
     trades = []
     in_pos, entry_p, current_sl, tp, p_type = False, 0, 0, 0, ""
     e_f, e_s = f'EMA_{fast_ema}', f'EMA_{slow_ema}'
@@ -78,92 +75,96 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
             if p[e_f] <= p[e_s] and c[e_f] > c[e_s] and c['RSI_14'] > 50 and c['ADX_14'] >= adx_threshold and is_bullish:
                 in_pos, p_type, entry_p = True, "LONG", c['Close']
                 current_sl = entry_p - (c['ATR_14'] * 2.0)
-                tp = entry_p + (c['ATR_14'] * 5.0)
-            elif p[e_f] >= p[e_s] and c[e_f] < c[e_s] and c['RSI_14'] < 45 and c['ADX_14'] >= adx_threshold and is_bearish:
+                tp = entry_p + (c['ATR_14'] * tp_multiplier)
+            elif p[e_f] >= p[e_s] and c[e_f] < c[e_s] and c['RSI_14'] < 48 and c['ADX_14'] >= adx_threshold and is_bearish:
                 in_pos, p_type, entry_p = True, "SHORT", c['Close']
                 current_sl = entry_p + (c['ATR_14'] * 2.0)
-                tp = entry_p - (c['ATR_14'] * 5.0)
+                tp = entry_p - (c['ATR_14'] * tp_multiplier)
         else:
-            # TRAILING STOP LOGIC: Fiyat lehine gittikçe Stop'u taşı
+            res = ""
+            current_profit_atr = abs(c['Close'] - entry_p) / c['ATR_14']
+            
+            # 1. BREAK-EVEN LOGIC: Kâr belirli bir noktaya gelince Stop'u girişe çek
+            if current_profit_atr >= be_trigger:
+                if p_type == "LONG": current_sl = max(current_sl, entry_p)
+                else: current_sl = min(current_sl, entry_p)
+
+            # 2. TRAILING STOP LOGIC
             if p_type == "LONG":
                 new_sl = c['Close'] - (c['ATR_14'] * trailing_factor)
                 if new_sl > current_sl: current_sl = new_sl
-                
-                if c['Low'] <= current_sl: res, exit_p = "LOSS/TS", current_sl
+                if c['Low'] <= current_sl: res, exit_p = "STOP/BE", current_sl
                 elif c['High'] >= tp: res, exit_p = "WIN", tp
-                else: res = ""
             else:
                 new_sl = c['Close'] + (c['ATR_14'] * trailing_factor)
                 if new_sl < current_sl: current_sl = new_sl
-                
-                if c['High'] >= current_sl: res, exit_p = "LOSS/TS", current_sl
+                if c['High'] >= current_sl: res, exit_p = "STOP/BE", current_sl
                 elif c['Low'] <= tp: res, exit_p = "WIN", tp
-                else: res = ""
             
             if res:
                 pnl = ((exit_p - entry_p)/entry_p)*100 if p_type == "LONG" else ((entry_p - exit_p)/entry_p)*100
                 trades.append({"Date": df_combined.index[i], "Type": p_type, "Result": res, "PnL_%": round(pnl, 2)})
                 in_pos = False
                 
-    return pd.DataFrame(trades), df_combined.iloc[-1]
+    return pd.DataFrame(trades)
 
 # ==========================================
 # ANA PANEL
 # ==========================================
 def main():
-    st.title("QUANT LAB V6.3 // NVDA SHIELD")
+    st.title("QUANT LAB V6.4 // PROFIT HARVESTER")
     
     with st.sidebar:
         st.header("SİSTEM KONTROLÜ")
         sym = st.selectbox("Varlık", ["NVDA", "TSLA", "BTC-USD"])
         
-        st.subheader("İnce Ayarlar")
+        st.subheader("Giriş Ayarları")
         f_ema = st.slider("Hızlı EMA", 5, 50, 9)
         s_ema = st.slider("Yavaş EMA", 10, 200, 21)
-        adx_t = st.slider("ADX Filtresi", 0, 40, 20) # NVDA için 20'ye çıkardık
+        adx_t = st.slider("ADX Filtresi", 0, 40, 15)
+        
+        st.subheader("Hasat Ayarları (TP)")
+        tp_mult = st.slider("Kâr Al (ATR x)", 1.5, 6.0, 2.5, help="NVDA için 2.5-3.0 önerilir.")
+        be_trig = st.slider("Başa Baş Çekme (ATR x)", 0.5, 3.0, 1.2, help="Kâr bu seviyeye gelince stopu girişe çeker.")
         
         st.subheader("Koruma Kalkanı")
-        use_mtf = st.checkbox("Büyük Abi (1h) Aktif", value=True)
-        ts_factor = st.slider("Trailing Stop (ATR x)", 1.0, 4.0, 2.0)
+        ts_factor = st.slider("Takip Eden Stop (ATR x)", 1.0, 4.0, 1.8)
+        use_mtf = st.checkbox("Büyük Abi (1h Trend) Aktif", value=True)
         
-        btn = st.button("NVDA SHIELD TESTİNİ BAŞLAT")
+        btn = st.button("HASADI BAŞLAT")
 
     if btn:
         try:
-            with st.spinner("Zırhlı backtest çalışıyor..."):
+            with st.spinner("Piyasa taranıyor..."):
                 df_15m = yf.download(sym, period="60d", interval="15m", progress=False)
                 df_1h = yf.download(sym, period="730d", interval="1h", progress=False)
-                
                 if isinstance(df_15m.columns, pd.MultiIndex): df_15m.columns = df_15m.columns.droplevel(1)
                 if isinstance(df_1h.columns, pd.MultiIndex): df_1h.columns = df_1h.columns.droplevel(1)
-                
                 df_15m.dropna(inplace=True); df_1h.dropna(inplace=True)
                 
                 df_15m = calculate_indicators(df_15m, f_ema, s_ema)
                 df_1h = calculate_indicators(df_1h, 5, 200, is_trend_check=True)
 
-                results, last_row = run_elite_backtest(df_15m, df_1h, 20, f_ema, s_ema, adx_t, use_mtf, ts_factor)
+                results = run_elite_backtest(df_15m, df_1h, 20, f_ema, s_ema, adx_t, use_mtf, ts_factor, tp_mult, be_trig)
 
                 if not results.empty:
                     wins = len(results[results['Result']=='WIN'])
                     total_pnl = results['PnL_%'].sum()
                     
-                    st.markdown("### `[ZIRHLI PERFORMANS ANALİZİ]`")
+                    st.markdown("### `[HASAT SONUÇLARI]`")
                     c1, c2, c3 = st.columns(3)
-                    c1.metric("Win Rate", f"%{(wins/len(results)*100):.1f}")
+                    c1.metric("Kazanma Oranı", f"%{(wins/len(results)*100):.1f}")
                     c2.metric("Net PnL", f"%{total_pnl:.2f}")
-                    c3.metric("Korunan Kâr (TS)", len(results[results['Result']=='LOSS/TS']))
+                    c3.metric("Kurtarılan İşlem", len(results[results['Result']=='STOP/BE']))
 
-                    # Kâr Grafiği
                     results['Cum_PnL'] = results['PnL_%'].cumsum()
                     fig = go.Figure(go.Scatter(x=results['Date'], y=results['Cum_PnL'], line=dict(color='#00FF41', width=3)))
-                    fig.update_layout(title="Kümülatif Getiri Eğrisi", template="plotly_dark", height=300)
+                    fig.update_layout(title=f"{sym} Kümülatif Getiri", template="plotly_dark", height=300)
                     st.plotly_chart(fig, use_container_width=True)
                     
                     st.dataframe(results.tail(10))
                 else:
-                    st.warning("Bu sert ayarlarla NVDA'da güvenli bir trend bulunamadı. Beklemede kalmak en iyisi!")
-                    
+                    st.warning("Trend bulunamadı. Ayarları gevşetebilirsiniz.")
         except Exception as e:
             st.error(f"Hata: {e}")
 
