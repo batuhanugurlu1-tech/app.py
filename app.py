@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 # ==========================================
 # UI YAPILANDIRMASI
 # ==========================================
-st.set_page_config(page_title="QUANT LAB V6.5 // SCALPER PRO", layout="wide")
+st.set_page_config(page_title="QUANT LAB V6.6 // VOLATILITY SHIELD", layout="wide")
 
 st.markdown("""
     <style>
@@ -46,6 +46,10 @@ def calculate_indicators(df, fast_ema, slow_ema, is_trend_check=False):
     tr = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
     df['ATR_14'] = tr.ewm(alpha=1/14, adjust=False).mean()
     
+    # Volatilite Filtresi: Anlık ATR / Tarihsel ATR (200 periyot)
+    df['ATR_MA_200'] = df['ATR_14'].rolling(window=200).mean()
+    df['Vol_Ratio'] = df['ATR_14'] / df['ATR_MA_200']
+    
     # ADX (14)
     up_move = df['High'] - df['High'].shift(1)
     down_move = df['Low'].shift(1) - df['Low']
@@ -59,9 +63,9 @@ def calculate_indicators(df, fast_ema, slow_ema, is_trend_check=False):
     return df
 
 # ==========================================
-# BACKTEST MOTORU (V6.5 - SCALPER PRO)
+# BACKTEST MOTORU (V6.6 - VOLATILITY SHIELD)
 # ==========================================
-def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_threshold, use_mtf, trailing_factor, tp_multiplier, be_trigger, use_early_exit):
+def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_threshold, use_mtf, trailing_factor, tp_multiplier, be_trigger, vol_threshold):
     trades = []
     in_pos, entry_p, current_sl, tp, p_type = False, 0, 0, 0, ""
     e_f, e_s = f'EMA_{fast_ema}', f'EMA_{slow_ema}'
@@ -69,7 +73,6 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
     df_1h_trend = df_1h[['EMA_200_Trend']].rename(columns={'EMA_200_Trend': 'BIG_BROTHER_TREND'})
     df_combined = df_15m.join(df_1h_trend, how='left').ffill()
 
-    # Başlangıç indeksini belirle
     start_idx = max(200, slow_ema)
     if len(df_combined) <= start_idx:
         return pd.DataFrame()
@@ -80,14 +83,18 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
 
         is_bullish = c['Close'] > c['BIG_BROTHER_TREND'] if use_mtf else True
         is_bearish = c['Close'] < c['BIG_BROTHER_TREND'] if use_mtf else True
+        
+        # VOLATILITY SHIELD: Piyasa yeterince hareketli mi? (Çok düşük veya aşırı yüksek volatilitede girmeyi engeller)
+        vol_ok = 0.8 <= c['Vol_Ratio'] <= vol_threshold
 
         if not in_pos:
-            # GİRİŞ KOŞULLARI
-            if p[e_f] <= p[e_s] and c[e_f] > c[e_s] and c['RSI_14'] > 50 and c['ADX_14'] >= adx_threshold and is_bullish:
+            # LONG GİRİŞ
+            if p[e_f] <= p[e_s] and c[e_f] > c[e_s] and c['RSI_14'] > 52 and c['ADX_14'] >= adx_threshold and is_bullish and vol_ok:
                 in_pos, p_type, entry_p = True, "LONG", c['Close']
                 current_sl = entry_p - (c['ATR_14'] * 2.0)
                 tp = entry_p + (c['ATR_14'] * tp_multiplier)
-            elif p[e_f] >= p[e_s] and c[e_f] < c[e_s] and c['RSI_14'] < 48 and c['ADX_14'] >= adx_threshold and is_bearish:
+            # SHORT GİRİŞ
+            elif p[e_f] >= p[e_s] and c[e_f] < c[e_s] and c['RSI_14'] < 48 and c['ADX_14'] >= adx_threshold and is_bearish and vol_ok:
                 in_pos, p_type, entry_p = True, "SHORT", c['Close']
                 current_sl = entry_p + (c['ATR_14'] * 2.0)
                 tp = entry_p - (c['ATR_14'] * tp_multiplier)
@@ -95,19 +102,17 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
             res = ""
             current_profit_atr = abs(c['Close'] - entry_p) / c['ATR_14']
             
-            # 1. BAŞA BAŞA ÇEKME (Break-Even)
+            # BREAK-EVEN (Başa Baş)
             if current_profit_atr >= be_trigger:
                 if p_type == "LONG": current_sl = max(current_sl, entry_p)
                 else: current_sl = min(current_sl, entry_p)
 
-            # 2. ERKEN ÇIKIŞ (Scalper Logic)
-            if use_early_exit:
-                if p_type == "LONG" and c[e_f] < c[e_s]:
-                    res, exit_p = "SCALP/EXIT", c['Close']
-                elif p_type == "SHORT" and c[e_f] > c[e_s]:
-                    res, exit_p = "SCALP/EXIT", c['Close']
+            # RSI ERKEN HASAT (Scalp)
+            if p_type == "LONG" and c['RSI_14'] < 50:
+                res, exit_p = "RSI/EXIT", c['Close']
+            elif p_type == "SHORT" and c['RSI_14'] > 50:
+                res, exit_p = "RSI/EXIT", c['Close']
 
-            # 3. TAKİP EDEN STOP VE HEDEFLER
             if not res:
                 if p_type == "LONG":
                     new_sl = c['Close'] - (c['ATR_14'] * trailing_factor)
@@ -131,31 +136,30 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
 # ANA PANEL
 # ==========================================
 def main():
-    st.title("QUANT LAB V6.5 // SCALPER PRO")
+    st.title("QUANT LAB V6.6 // VOLATILITY SHIELD")
     
     with st.sidebar:
         st.header("SİSTEM KONTROLÜ")
         sym = st.selectbox("Varlık", ["NVDA", "TSLA", "BTC-USD"])
         
-        st.subheader("Giriş Ayarları")
+        st.subheader("Giriş Filtreleri")
         f_ema = st.slider("Hızlı EMA", 5, 50, 9)
         s_ema = st.slider("Yavaş EMA", 10, 200, 21)
-        adx_t = st.slider("ADX Filtresi", 0, 40, 15)
+        adx_t = st.slider("ADX Filtresi", 0, 40, 18)
+        vol_t = st.slider("Volatilite Sınırı (Ratio)", 1.0, 5.0, 2.0, help="Piyasa aşırı oynaksa (kaotikse) işleme girmeyi engeller.")
         
-        st.subheader("Scalping Ayarları")
-        use_exit = st.checkbox("Erken Çıkış (EMA Cross) Aktif", value=True)
-        tp_mult = st.slider("Maks. Hedef (ATR x)", 1.5, 6.0, 3.0)
-        be_trig = st.slider("BE Aktif Etme (ATR x)", 0.5, 3.0, 1.0)
+        st.subheader("Hasat & Risk")
+        tp_mult = st.slider("Kâr Hedefi (ATR x)", 1.0, 5.0, 2.0)
+        be_trig = st.slider("BE Aktif Etme (ATR x)", 0.5, 2.5, 0.8)
+        ts_factor = st.slider("Takip Eden Stop (ATR x)", 1.0, 3.0, 1.2)
         
-        st.subheader("Risk Kontrolü")
-        ts_factor = st.slider("Takip Eden Stop (ATR x)", 1.0, 4.0, 1.5)
-        use_mtf = st.checkbox("Büyük Abi Filtresi Aktif", value=True)
+        use_mtf = st.checkbox("Büyük Abi (1h) Aktif", value=True)
         
-        btn = st.button("SCALPER TESTİNİ BAŞLAT")
+        btn = st.button("KALKANLI TESTİ BAŞLAT")
 
     if btn:
         try:
-            with st.spinner("Piyasa verileri taranıyor..."):
+            with st.spinner("Volatilite kalkanı ayarlanıyor..."):
                 df_15m = yf.download(sym, period="60d", interval="15m", progress=False)
                 df_1h = yf.download(sym, period="730d", interval="1h", progress=False)
                 
@@ -164,40 +168,33 @@ def main():
                 
                 df_15m.dropna(inplace=True); df_1h.dropna(inplace=True)
                 
-                if df_15m.empty or df_1h.empty:
-                    st.error("Veri alınamadı. Lütfen varlığı değiştirin.")
-                    return
-
                 df_15m = calculate_indicators(df_15m, f_ema, s_ema)
                 df_1h = calculate_indicators(df_1h, 5, 200, is_trend_check=True)
 
-                results = run_elite_backtest(df_15m, df_1h, 20, f_ema, s_ema, adx_t, use_mtf, ts_factor, tp_mult, be_trig, use_exit)
+                results = run_elite_backtest(df_15m, df_1h, 25, f_ema, s_ema, adx_t, use_mtf, ts_factor, tp_mult, be_trig, vol_t)
 
                 if results is not None and not results.empty:
-                    wins = len(results[results['Result']=='WIN'])
-                    scalps = len(results[results['Result']=='SCALP/EXIT'])
                     pos_trades = results[results['PnL_%'] > 0]
                     total_pnl = results['PnL_%'].sum()
                     
-                    # Profit Factor hesaplama
                     neg_pnl = results[results['PnL_%'] < 0]['PnL_%'].sum()
                     profit_factor = abs(results[results['PnL_%'] > 0]['PnL_%'].sum() / neg_pnl) if neg_pnl != 0 else 0
                     
-                    st.markdown("### `[SCALPER PERFORMANS ANALİZİ]`")
+                    st.markdown("### `[VOLATILITY SHIELD ANALİZİ]`")
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Win Rate (Net)", f"%{(len(pos_trades)/len(results)*100):.1f}")
-                    c2.metric("Net PnL", f"%{total_pnl:.2f}")
-                    c3.metric("Erken Hasat (Scalp)", scalps)
-                    c4.metric("Profit Factor", f"{profit_factor:.2f}")
+                    c1.metric("Net Win Rate", f"%{(len(pos_trades)/len(results)*100):.1f}")
+                    c2.metric("Toplam PnL", f"%{total_pnl:.2f}")
+                    c3.metric("Profit Factor", f"{profit_factor:.2f}")
+                    c4.metric("İşlem Sayısı", len(results))
 
                     results['Cum_PnL'] = results['PnL_%'].cumsum()
                     fig = go.Figure(go.Scatter(x=results['Date'], y=results['Cum_PnL'], line=dict(color='#00FF41', width=3), fill='tozeroy'))
-                    fig.update_layout(title=f"{sym} Kâr Eğrisi", template="plotly_dark", height=300)
+                    fig.update_layout(title=f"{sym} Kümülatif Getiri (V6.6)", template="plotly_dark", height=300)
                     st.plotly_chart(fig, use_container_width=True)
                     
                     st.dataframe(results.tail(15))
                 else:
-                    st.warning("Bu ayarlarla geçmişte uygun işlem bulunamadı. Lütfen ADX veya EMA değerlerini gevşetin.")
+                    st.warning("Bu kalkan seviyesinde uygun trend bulunamadı. Volatilite Ratio veya ADX değerini gevşetin.")
         except Exception as e:
             st.error(f"Sistem Hatası: {e}")
 
