@@ -4,9 +4,9 @@ import pandas as pd
 import numpy as np
 
 # ==========================================
-# GÖRSEL TASARIM (ELITE SAAS THEME)
+# UI YAPILANDIRMASI (Elite SaaS Teması)
 # ==========================================
-st.set_page_config(page_title="QUANT LAB V6 // ELITE MTF", layout="wide")
+st.set_page_config(page_title="QUANT LAB V6.1 // LIVE SIGNALS", layout="wide")
 
 st.markdown("""
     <style>
@@ -19,14 +19,20 @@ st.markdown("""
         border-radius: 8px; 
         height: 3.5em; 
         border: none;
-        transition: transform 0.2s;
     }
-    .stButton>button:hover { transform: scale(1.02); }
     .stMetric { 
         background-color: #1A1D23; 
         border: 1px solid #333; 
         border-radius: 10px; 
         padding: 15px; 
+    }
+    .signal-card {
+        padding: 20px;
+        border-radius: 15px;
+        text-align: center;
+        margin-bottom: 25px;
+        font-weight: bold;
+        font-size: 1.2em;
     }
     h1, h2, h3 { color: #00FF41 !important; }
     </style>
@@ -43,7 +49,7 @@ def calculate_indicators(df, fast_ema, slow_ema, is_trend_check=False):
     df[f'EMA_{slow_ema}'] = df['Close'].ewm(span=slow_ema, adjust=False).mean()
     
     if is_trend_check:
-        # Büyük Abi: 1 Saatlik EMA 200 (Ana Yön Belirleyici)
+        # Büyük Abi: 1 Saatlik EMA 200
         df['EMA_200_Trend'] = df['Close'].ewm(span=200, adjust=False).mean()
         return df
 
@@ -53,11 +59,11 @@ def calculate_indicators(df, fast_ema, slow_ema, is_trend_check=False):
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     df['RSI_14'] = 100 - (100 / (1 + (gain / loss)))
     
-    # ATR (14) - Dinamik Zarar Kes/Kar Al
+    # ATR (14)
     tr = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
     df['ATR_14'] = tr.ewm(alpha=1/14, adjust=False).mean()
     
-    # ADX (14) - Trend Gücü
+    # ADX (14)
     up_move = df['High'] - df['High'].shift(1)
     down_move = df['Low'].shift(1) - df['Low']
     plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
@@ -70,14 +76,13 @@ def calculate_indicators(df, fast_ema, slow_ema, is_trend_check=False):
     return df
 
 # ==========================================
-# ELITE BACKTEST MOTORU (MTF)
+# ELITE BACKTEST MOTORU
 # ==========================================
 def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_threshold, use_mtf):
     trades = []
     in_pos, entry_p, sl, tp, p_type = False, 0, 0, 0, ""
     e_f, e_s = f'EMA_{fast_ema}', f'EMA_{slow_ema}'
 
-    # 1H trend verisini 15m zaman dilimine eşle (Veri sızıntısını engellemek için ffill)
     df_1h_trend = df_1h[['EMA_200_Trend']].rename(columns={'EMA_200_Trend': 'BIG_BROTHER_TREND'})
     df_combined = df_15m.join(df_1h_trend, how='left').ffill()
 
@@ -85,24 +90,17 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
         if len(trades) >= target_trades: break
         c, p = df_combined.iloc[i], df_combined.iloc[i-1]
 
-        # Büyük Abi Filtresi: Ana trend ne yönde?
-        # Sadece fiyat EMA 200 üzerindeyse LONG, altındaysa SHORT aramasına izin ver.
         is_bullish = c['Close'] > c['BIG_BROTHER_TREND'] if use_mtf else True
         is_bearish = c['Close'] < c['BIG_BROTHER_TREND'] if use_mtf else True
 
         if not in_pos:
-            # LONG GİRİŞ: EMA Cross + RSI + ADX + MTF ONAYI
             if p[e_f] <= p[e_s] and c[e_f] > c[e_s] and c['RSI_14'] > 50 and c['ADX_14'] >= adx_threshold and is_bullish:
                 in_pos, p_type, entry_p = True, "LONG", c['Close']
-                # Profesyonel R:R (1:2)
                 sl, tp = entry_p - (c['ATR_14']*2.5), entry_p + (c['ATR_14']*5)
-            
-            # SHORT GİRİŞ: EMA Cross + RSI + ADX + MTF ONAYI
             elif p[e_f] >= p[e_s] and c[e_f] < c[e_s] and c['RSI_14'] < 50 and c['ADX_14'] >= adx_threshold and is_bearish:
                 in_pos, p_type, entry_p = True, "SHORT", c['Close']
                 sl, tp = entry_p + (c['ATR_14']*2.5), entry_p - (c['ATR_14']*5)
         else:
-            # ÇIKIŞ KOŞULLARI (STOP LOSS / TAKE PROFIT)
             res, exit_p = "", 0
             if p_type == "LONG":
                 if c['Low'] <= sl: res, exit_p = "LOSS", sl
@@ -118,83 +116,92 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
                     "Tip": p_type, "Sonuç": res, "PnL_%": round(pnl, 2)
                 })
                 in_pos = False
-    return pd.DataFrame(trades)
+    return pd.DataFrame(trades), df_combined.iloc[-1]
 
 # ==========================================
-# ANA PANEL (UI)
+# ANA PANEL
 # ==========================================
 def main():
-    st.title("QUANT LAB V6 // ELITE MTF")
-    st.caption("Büyük Abi (1h EMA 200) Trend Filtresi Aktif")
+    st.title("QUANT LAB V6.1 // LIVE SIGNALS")
     
     with st.sidebar:
         st.header("SİSTEM KONTROLÜ")
-        sym = st.selectbox("Varlık Seçin", ["TSLA", "BTC-USD", "NVDA", "AAPL", "ETH-USD"])
+        # Daha fazla varlık eklendi
+        assets = {
+            "TSLA": "TSLA", "NVDA": "NVDA", "BTC-USD": "BTC-USD", 
+            "ETH-USD": "ETH-USD", "SOL-USD": "SOL-USD", "AMZN": "AMZN", 
+            "AAPL": "AAPL", "GOOGL": "GOOGL", "NFLX": "NFLX"
+        }
+        sym_label = st.selectbox("Varlık Seçin", list(assets.keys()))
+        sym = assets[sym_label]
         
         st.subheader("Küçük Abi (15m) Ayarları")
         f_ema = st.slider("Hızlı EMA", 5, 50, 5)
         s_ema = st.slider("Yavaş EMA", 10, 200, 13)
-        adx_t = st.slider("ADX Filtresi", 0, 40, 15)
+        adx_t = st.slider("ADX Filtresi", 0, 40, 10) # Tesla için bulduğun tatlı nokta 10'u varsayılan yaptık
         
         st.subheader("Büyük Abi (1h) Ayarları")
-        use_mtf = st.checkbox("MTF Filtresini Aktif Et", value=True)
+        use_mtf = st.checkbox("Büyük Abi Filtresi Aktif", value=True)
         
         st.divider()
-        t_count = st.number_input("İşlem Hedefi", 5, 100, 20)
-        btn = st.button("ELITE DENEYİ BAŞLAT")
+        t_count = st.number_input("Backtest İşlem Sayısı", 5, 100, 20)
+        btn = st.button("CANLI ANALİZ & TEST BAŞLAT")
 
     if btn:
         try:
-            with st.spinner("Zaman dilimleri senkronize ediliyor..."):
-                # Verileri indir (15m ve 1h)
+            with st.spinner("Piyasa verileri anlık olarak taranıyor..."):
                 df_15m = yf.download(sym, period="60d", interval="15m", progress=False)
                 df_1h = yf.download(sym, period="730d", interval="1h", progress=False)
                 
-                # MultiIndex sütunlarını temizle
                 if isinstance(df_15m.columns, pd.MultiIndex): df_15m.columns = df_15m.columns.droplevel(1)
                 if isinstance(df_1h.columns, pd.MultiIndex): df_1h.columns = df_1h.columns.droplevel(1)
                 
                 df_15m.dropna(inplace=True); df_1h.dropna(inplace=True)
                 
-                # İndikatörleri hesapla
+                # İndikatörler
                 df_15m = calculate_indicators(df_15m, f_ema, s_ema)
                 df_1h = calculate_indicators(df_1h, 5, 200, is_trend_check=True)
 
-                # Simülasyonu çalıştır
-                results = run_elite_backtest(df_15m, df_1h, t_count, f_ema, s_ema, adx_t, use_mtf)
+                # Test & Canlı Durum
+                results, last_row = run_elite_backtest(df_15m, df_1h, t_count, f_ema, s_ema, adx_t, use_mtf)
 
-                if results.empty:
-                    st.warning("⚠️ Büyük Abi trend yönünde güvenli işlem bulamadı! Filtreyi gevşetmeyi deneyin.")
+                # --- CANLI SİNYAL PANELİ ---
+                st.markdown("### `[CANLI PİYASA DURUMU]`")
+                
+                # Sinyal mantığı kontrolü
+                e_f, e_s = f'EMA_{f_ema}', f'EMA_{s_ema}'
+                trend_ok = last_row['Close'] > last_row['BIG_BROTHER_TREND'] if use_mtf else True
+                bear_trend_ok = last_row['Close'] < last_row['BIG_BROTHER_TREND'] if use_mtf else True
+                
+                if last_row[e_f] > last_row[e_s] and last_row['ADX_14'] >= adx_t and trend_ok:
+                    st.markdown("<div class='signal-card' style='background-color: #00FF41; color: #0A0A0A;'>🚀 CANLI SİNYAL: LONG (ALIM) ZAMANI</div>", unsafe_allow_html=True)
+                    st.success(f"Büyük Abi Onaylı! Fiyat {last_row['Close']:.2f} | Hedef: {(last_row['Close'] + last_row['ATR_14']*5):.2f}")
+                elif last_row[e_f] < last_row[e_s] and last_row['ADX_14'] >= adx_t and bear_trend_ok:
+                    st.markdown("<div class='signal-card' style='background-color: #FF003C; color: #FFFFFF;'>📉 CANLI SİNYAL: SHORT (SATIŞ) ZAMANI</div>", unsafe_allow_html=True)
+                    st.error(f"Düşüş Trendi Onaylı! Fiyat {last_row['Close']:.2f} | Hedef: {(last_row['Close'] - last_row['ATR_14']*5):.2f}")
                 else:
+                    st.markdown("<div class='signal-card' style='background-color: #333; color: #888;'>⏳ ŞU AN SİNYAL YOK - BEKLEMEDE KAL</div>", unsafe_allow_html=True)
+                    st.info(f"Neden Sinyal Yok? ADX Gücü: {last_row['ADX_14']:.1f} / Gerekli: {adx_t} | Büyük Abi: {'UYGUN' if trend_ok or bear_trend_ok else 'UYGUN DEĞİL'}")
+
+                # --- BACKTEST PANELİ ---
+                st.divider()
+                st.markdown("### `[STRATEJİ PERFORMANS ÖZETİ]`")
+                if not results.empty:
                     wins = len(results[results['Sonuç']=='WIN'])
                     wr = (wins / len(results)) * 100
                     pnl = results['PnL_%'].sum()
                     
-                    st.markdown("### `[ELITE PERFORMANS ÖZETİ]`")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Toplam İşlem", len(results))
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("İşlem", len(results))
                     c2.metric("Win Rate", f"%{wr:.1f}")
                     c3.metric("Net PnL", f"%{pnl:.2f}")
-                    c4.metric("MTF Koruması", "AKTİF" if use_mtf else "KAPALI")
                     
-                    st.divider()
-                    
-                    # Tabloyu Renklendirerek göster
-                    def highlight(val):
-                        color = '#00FF41' if val == 'WIN' else '#FF003C'
-                        return f'color: {color}; font-weight: bold;'
-                    st.table(results.style.applymap(highlight, subset=['Sonuç']))
-                    
-                    # Rapor Dışa Aktarım
-                    st.markdown("#### `[ANALİST RAPORU]`")
-                    mtf_status = "ON" if use_mtf else "OFF"
-                    final_rep = f"VARLIK: {sym} | MTF: {mtf_status} | EMA: {f_ema}/{s_ema} | ADX: >{adx_t}\nTOTAL: {len(results)} | WR: %{wr:.1f} | PnL: %{pnl:.2f}"
-                    st.code(final_rep)
+                    st.table(results.tail(10))
+                else:
+                    st.warning("Bu ayarlarla geçmişte işlem bulunamadı.")
                     
         except Exception as e:
             st.error(f"Sistem Hatası: {str(e)}")
-    else:
-        st.info("👈 'Büyük Abi' filtresiyle Tesla'nın vahşi hareketlerini dizginle. Deneyi başlat!")
 
 if __name__ == "__main__":
     main()
