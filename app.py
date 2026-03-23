@@ -22,7 +22,6 @@ st.markdown("""
 # SCIENTIFIC CALCULATION ENGINE
 # ==========================================
 def calculate_indicators(df: pd.DataFrame, fast_ema: int, slow_ema: int) -> pd.DataFrame:
-    """Kullanıcının belirlediği EMA değerlerine göre hesaplama yapar."""
     if df.empty or len(df) < slow_ema: return df
     
     df[f'EMA_{fast_ema}'] = df['Close'].ewm(span=fast_ema, adjust=False).mean()
@@ -40,7 +39,6 @@ def calculate_indicators(df: pd.DataFrame, fast_ema: int, slow_ema: int) -> pd.D
 # AUTO-TRADE BACKTEST SIMULATOR
 # ==========================================
 def run_backtest(df: pd.DataFrame, target_trades: int, fast_ema: int, slow_ema: int):
-    """Dinamik strateji kurallarına göre geçmiş veriler üzerinde simülasyon yapar."""
     in_position = False
     entry_price, sl, tp = 0.0, 0.0, 0.0
     pos_type = ""
@@ -55,24 +53,17 @@ def run_backtest(df: pd.DataFrame, target_trades: int, fast_ema: int, slow_ema: 
         current = df.iloc[i]
         prev = df.iloc[i-1]
         
-        # GİRİŞ ŞARTLARI
         if not in_position:
-            # LONG: Hızlı EMA, Yavaş EMA'yı yukarı kesti ve RSI > 50
             if prev[ema_f] <= prev[ema_s] and current[ema_f] > current[ema_s] and current['RSI_14'] > 50:
                 in_position = True; pos_type = "LONG"; entry_price = current['Close']
                 sl = entry_price - (current['ATR_14'] * 2)
-                tp = entry_price + (current['ATR_14'] * 4) # 1:2 Risk/Reward
-            
-            # SHORT: Hızlı EMA, Yavaş EMA'yı aşağı kesti ve RSI < 50
+                tp = entry_price + (current['ATR_14'] * 4) 
             elif prev[ema_f] >= prev[ema_s] and current[ema_f] < current[ema_s] and current['RSI_14'] < 50:
                 in_position = True; pos_type = "SHORT"; entry_price = current['Close']
                 sl = entry_price + (current['ATR_14'] * 2)
-                tp = entry_price - (current['ATR_14'] * 4) # 1:2 Risk/Reward
-                
-        # ÇIKIŞ ŞARTLARI
+                tp = entry_price - (current['ATR_14'] * 4) 
         else:
             exit_price, result = 0.0, ""
-            
             if pos_type == "LONG":
                 if current['Low'] <= sl: exit_price, result = sl, "LOSS"
                 elif current['High'] >= tp: exit_price, result = tp, "WIN"
@@ -108,7 +99,6 @@ def main():
         symbol = st.selectbox("Varlık (Asset)", ["BTC-USD", "ETH-USD", "NVDA", "TSLA", "AAPL"])
         timeframe = st.selectbox("Zaman Dilimi", ["1d (Günlük)", "1h (Saatlik)", "15m (15 Dakika)"])
         
-        # Yahoo Finance limitlerini yönetmek için zaman aralığı haritası
         tf_code = timeframe.split(" ")[0]
         period_map = {"1d": "5y", "1h": "730d", "15m": "60d"}
         period = period_map[tf_code]
@@ -135,7 +125,7 @@ def main():
                 trades_df = run_backtest(df, target_trades=trade_count, fast_ema=fast_ema, slow_ema=slow_ema)
                 
                 if trades_df.empty:
-                    st.warning("Seçilen zaman diliminde bu EMA ayarlarına uygun kesişim bulunamadı. Lütfen daha düşük EMA'lar veya daha kısa zaman dilimi deneyin.")
+                    st.warning("Seçilen zaman diliminde bu EMA ayarlarına uygun kesişim bulunamadı.")
                     return
                 
                 total_trades = len(trades_df)
@@ -153,6 +143,22 @@ def main():
                 with c2: st.markdown(f"<div class='quant-card'><h5>WIN / LOSS</h5><h2><span style='color:#00FF41'>{wins}</span> / <span style='color:#FF003C'>{losses}</span></h2></div>", unsafe_allow_html=True)
                 with c3: st.markdown(f"<div class='quant-card'><h5>WIN RATE</h5><h2 style='color:{wr_color};'>{win_rate:.1f}%</h2></div>", unsafe_allow_html=True)
                 with c4: st.markdown(f"<div class='quant-card'><h5>TOTAL NET KÂR (%)</h5><h2 style='color:{pnl_color};'>{total_pnl:.2f}%</h2></div>", unsafe_allow_html=True)
+
+                # --- YENİ EKLENEN KOPYALAMA MODÜLÜ ---
+                st.markdown("### `[HIZLI RAPOR DIŞA AKTARIMI]`")
+                st.caption("Aşağıdaki kutunun sağ üst köşesindeki ikon ile sonuçları kopyalayıp analiste yapıştırın.")
+                report_text = f"""📊 QUANT LAB BACKTEST RAPORU
+Varlık: {symbol} | Zaman Dilimi: {timeframe}
+Strateji: EMA {fast_ema} / EMA {slow_ema} Kesişimi
+Hedef İşlem: {trade_count}
+-----------------------------------
+Gerçekleşen İşlem: {total_trades}
+Win/Loss: {wins}W / {losses}L
+Kazanma Oranı (Win Rate): %{win_rate:.1f}
+Toplam Net Kâr (PnL): %{total_pnl:.2f}
+-----------------------------------"""
+                st.code(report_text, language="markdown")
+                # ------------------------------------
 
                 st.markdown("### `[DETAYLI İŞLEM GEÇMİŞİ]`")
                 def color_result(val):
