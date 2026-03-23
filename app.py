@@ -6,7 +6,7 @@ import numpy as np
 # ==========================================
 # UI & THEME CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="QUANT LAB // STRATEGY TESTER", layout="wide")
+st.set_page_config(page_title="QUANT LAB // STRATEGY TESTER V5", layout="wide")
 
 st.markdown("""
     <style>
@@ -24,21 +24,39 @@ st.markdown("""
 def calculate_indicators(df: pd.DataFrame, fast_ema: int, slow_ema: int) -> pd.DataFrame:
     if df.empty or len(df) < slow_ema: return df
     
+    # EMAs
     df[f'EMA_{fast_ema}'] = df['Close'].ewm(span=fast_ema, adjust=False).mean()
     df[f'EMA_{slow_ema}'] = df['Close'].ewm(span=slow_ema, adjust=False).mean()
     
+    # RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     df['RSI_14'] = 100 - (100 / (1 + (gain / loss)))
     
-    df['ATR_14'] = pd.concat([df['High']-df['Low'], np.abs(df['High']-df['Close'].shift()), np.abs(df['Low']-df['Close'].shift())], axis=1).max(axis=1).ewm(alpha=1/14, adjust=False).mean()
+    # ATR (14)
+    tr = pd.concat([df['High']-df['Low'], np.abs(df['High']-df['Close'].shift()), np.abs(df['Low']-df['Close'].shift())], axis=1).max(axis=1)
+    df['ATR_14'] = tr.ewm(alpha=1/14, adjust=False).mean()
+    
+    # ADX (14) - Trend Gücü Filtresi
+    up_move = df['High'] - df['High'].shift(1)
+    down_move = df['Low'].shift(1) - df['Low']
+    
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    
+    plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=1/14, adjust=False).mean() / df['ATR_14'])
+    minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=1/14, adjust=False).mean() / df['ATR_14'])
+    
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+    df['ADX_14'] = dx.ewm(alpha=1/14, adjust=False).mean()
+    
     return df
 
 # ==========================================
 # AUTO-TRADE BACKTEST SIMULATOR
 # ==========================================
-def run_backtest(df: pd.DataFrame, target_trades: int, fast_ema: int, slow_ema: int):
+def run_backtest(df: pd.DataFrame, target_trades: int, fast_ema: int, slow_ema: int, adx_threshold: int):
     in_position = False
     entry_price, sl, tp = 0.0, 0.0, 0.0
     pos_type = ""
@@ -54,11 +72,12 @@ def run_backtest(df: pd.DataFrame, target_trades: int, fast_ema: int, slow_ema: 
         prev = df.iloc[i-1]
         
         if not in_position:
-            if prev[ema_f] <= prev[ema_s] and current[ema_f] > current[ema_s] and current['RSI_14'] > 50:
+            # YENİ KURAL: current['ADX_14'] > adx_threshold
+            if prev[ema_f] <= prev[ema_s] and current[ema_f] > current[ema_s] and current['RSI_14'] > 50 and current['ADX_14'] > adx_threshold:
                 in_position = True; pos_type = "LONG"; entry_price = current['Close']
                 sl = entry_price - (current['ATR_14'] * 2)
                 tp = entry_price + (current['ATR_14'] * 4) 
-            elif prev[ema_f] >= prev[ema_s] and current[ema_f] < current[ema_s] and current['RSI_14'] < 50:
+            elif prev[ema_f] >= prev[ema_s] and current[ema_f] < current[ema_s] and current['RSI_14'] < 50 and current['ADX_14'] > adx_threshold:
                 in_position = True; pos_type = "SHORT"; entry_price = current['Close']
                 sl = entry_price + (current['ATR_14'] * 2)
                 tp = entry_price - (current['ATR_14'] * 4) 
@@ -90,42 +109,43 @@ def run_backtest(df: pd.DataFrame, target_trades: int, fast_ema: int, slow_ema: 
 # ==========================================
 def main():
     col_title, col_live = st.columns([6, 1])
-    with col_title: st.title("QUANT LAB // STRATEGY TESTER")
+    with col_title: st.title("QUANT LAB // V5 ADX SHIELD")
     with col_live: st.markdown("<div style='background-color: #00FFFF; color: #0A0A0A; padding: 5px; border-radius: 5px; text-align: center; margin-top: 25px;'>LAB MODE</div>", unsafe_allow_html=True)
     st.divider()
 
     with st.sidebar:
         st.markdown("### `[1. VARLIK & ZAMAN]`")
-        symbol = st.selectbox("Varlık (Asset)", ["BTC-USD", "ETH-USD", "NVDA", "TSLA", "AAPL"])
-        timeframe = st.selectbox("Zaman Dilimi", ["1d (Günlük)", "1h (Saatlik)", "15m (15 Dakika)"])
+        symbol = st.selectbox("Varlık (Asset)", ["TSLA", "BTC-USD", "ETH-USD", "NVDA", "AAPL"])
+        timeframe = st.selectbox("Zaman Dilimi", ["15m (15 Dakika)", "1h (Saatlik)", "1d (Günlük)"])
         
         tf_code = timeframe.split(" ")[0]
         period_map = {"1d": "5y", "1h": "730d", "15m": "60d"}
         period = period_map[tf_code]
         
-        st.markdown("### `[2. STRATEJİ KURALLARI]`")
-        fast_ema = st.slider("Hızlı EMA (Trend Girişi)", min_value=5, max_value=50, value=9)
-        slow_ema = st.slider("Yavaş EMA (Ana Trend)", min_value=10, max_value=200, value=21)
+        st.markdown("### `[2. STRATEJİ & FİLTRELER]`")
+        fast_ema = st.slider("Hızlı EMA (Trend)", min_value=5, max_value=50, value=5)
+        slow_ema = st.slider("Yavaş EMA (Ana Yön)", min_value=10, max_value=200, value=13)
+        adx_thresh = st.slider("ADX Güç Şalteri (Testere Koruması)", min_value=0, max_value=40, value=20, help="20 ve üzeri: Güçlü trend. 0 yaparsanız filtre kapanır.")
         trade_count = st.number_input("Hedef İşlem Sayısı", min_value=5, max_value=100, value=20)
         
         st.divider()
-        run_sim = st.button(">> TESTİ BAŞLAT")
+        run_sim = st.button(">> ZIRHLI TESTİ BAŞLAT")
 
     if run_sim:
         if fast_ema >= slow_ema:
             st.error("⚠️ Hızlı EMA değeri, Yavaş EMA değerinden küçük olmalıdır!")
             return
             
-        with st.spinner(f"Kuantum motoru çalışıyor... {symbol} için {tf_code} grafik verileri indiriliyor ve taranıyor..."):
+        with st.spinner(f"ADX Kalkanı devrede... {symbol} için {tf_code} grafik verileri taranıyor..."):
             try:
                 df = yf.download(symbol, period=period, interval=tf_code, progress=False)
                 if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
                 df.dropna(inplace=True); df = calculate_indicators(df, fast_ema, slow_ema)
                 
-                trades_df = run_backtest(df, target_trades=trade_count, fast_ema=fast_ema, slow_ema=slow_ema)
+                trades_df = run_backtest(df, target_trades=trade_count, fast_ema=fast_ema, slow_ema=slow_ema, adx_threshold=adx_thresh)
                 
                 if trades_df.empty:
-                    st.warning("Seçilen zaman diliminde bu EMA ayarlarına uygun kesişim bulunamadı.")
+                    st.warning(f"ADX > {adx_thresh} filtresi çok sıkı olabilir. Bot bu zaman diliminde yeterince güçlü bir trend bulamadığı için hiçbir işleme girmedi (Testereden korundu!).")
                     return
                 
                 total_trades = len(trades_df)
@@ -144,21 +164,17 @@ def main():
                 with c3: st.markdown(f"<div class='quant-card'><h5>WIN RATE</h5><h2 style='color:{wr_color};'>{win_rate:.1f}%</h2></div>", unsafe_allow_html=True)
                 with c4: st.markdown(f"<div class='quant-card'><h5>TOTAL NET KÂR (%)</h5><h2 style='color:{pnl_color};'>{total_pnl:.2f}%</h2></div>", unsafe_allow_html=True)
 
-                # --- YENİ EKLENEN KOPYALAMA MODÜLÜ ---
                 st.markdown("### `[HIZLI RAPOR DIŞA AKTARIMI]`")
-                st.caption("Aşağıdaki kutunun sağ üst köşesindeki ikon ile sonuçları kopyalayıp analiste yapıştırın.")
-                report_text = f"""📊 QUANT LAB BACKTEST RAPORU
-Varlık: {symbol} | Zaman Dilimi: {timeframe}
-Strateji: EMA {fast_ema} / EMA {slow_ema} Kesişimi
-Hedef İşlem: {trade_count}
+                report_text = f"""📊 V5 ADX SHIELD RAPORU
+Varlık: {symbol} | Zaman: {timeframe}
+EMA: {fast_ema}/{slow_ema} | ADX Filtresi: >{adx_thresh}
 -----------------------------------
 Gerçekleşen İşlem: {total_trades}
 Win/Loss: {wins}W / {losses}L
-Kazanma Oranı (Win Rate): %{win_rate:.1f}
-Toplam Net Kâr (PnL): %{total_pnl:.2f}
+Kazanma Oranı: %{win_rate:.1f}
+Toplam Net Kâr: %{total_pnl:.2f}
 -----------------------------------"""
                 st.code(report_text, language="markdown")
-                # ------------------------------------
 
                 st.markdown("### `[DETAYLI İŞLEM GEÇMİŞİ]`")
                 def color_result(val):
@@ -169,7 +185,7 @@ Toplam Net Kâr (PnL): %{total_pnl:.2f}
             except Exception as e:
                 st.error(f"Sistem Hatası: {str(e)}")
     else:
-        st.info("👈 Yan menüden zaman dilimini ve EMA değerlerini ayarlayıp testi başlatın.")
+        st.info("👈 Yan menüden ADX ayarını yapıp zırhlı testi başlatın.")
 
 if __name__ == "__main__":
     main()
