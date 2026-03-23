@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 # ==========================================
 # UI YAPILANDIRMASI
 # ==========================================
-st.set_page_config(page_title="QUANT LAB V6.4 // PROFIT HARVESTER", layout="wide")
+st.set_page_config(page_title="QUANT LAB V6.5 // SCALPER PRO", layout="wide")
 
 st.markdown("""
     <style>
@@ -27,6 +27,7 @@ st.markdown("""
 def calculate_indicators(df, fast_ema, slow_ema, is_trend_check=False):
     if df.empty: return df
     
+    # EMA Hesaplamaları
     df[f'EMA_{fast_ema}'] = df['Close'].ewm(span=fast_ema, adjust=False).mean()
     df[f'EMA_{slow_ema}'] = df['Close'].ewm(span=slow_ema, adjust=False).mean()
     
@@ -34,14 +35,17 @@ def calculate_indicators(df, fast_ema, slow_ema, is_trend_check=False):
         df['EMA_200_Trend'] = df['Close'].ewm(span=200, adjust=False).mean()
         return df
 
+    # RSI (14)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     df['RSI_14'] = 100 - (100 / (1 + (gain / loss)))
     
+    # ATR (14)
     tr = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
     df['ATR_14'] = tr.ewm(alpha=1/14, adjust=False).mean()
     
+    # ADX (14)
     up_move = df['High'] - df['High'].shift(1)
     down_move = df['Low'].shift(1) - df['Low']
     plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
@@ -54,9 +58,9 @@ def calculate_indicators(df, fast_ema, slow_ema, is_trend_check=False):
     return df
 
 # ==========================================
-# BACKTEST MOTORU (V6.4 - PROFIT HARVESTER)
+# BACKTEST MOTORU (V6.5 - SCALPER PRO)
 # ==========================================
-def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_threshold, use_mtf, trailing_factor, tp_multiplier, be_trigger):
+def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_threshold, use_mtf, trailing_factor, tp_multiplier, be_trigger, use_early_exit):
     trades = []
     in_pos, entry_p, current_sl, tp, p_type = False, 0, 0, 0, ""
     e_f, e_s = f'EMA_{fast_ema}', f'EMA_{slow_ema}'
@@ -72,6 +76,7 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
         is_bearish = c['Close'] < c['BIG_BROTHER_TREND'] if use_mtf else True
 
         if not in_pos:
+            # GİRİŞ KOŞULLARI
             if p[e_f] <= p[e_s] and c[e_f] > c[e_s] and c['RSI_14'] > 50 and c['ADX_14'] >= adx_threshold and is_bullish:
                 in_pos, p_type, entry_p = True, "LONG", c['Close']
                 current_sl = entry_p - (c['ATR_14'] * 2.0)
@@ -84,22 +89,30 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
             res = ""
             current_profit_atr = abs(c['Close'] - entry_p) / c['ATR_14']
             
-            # 1. BREAK-EVEN LOGIC: Kâr belirli bir noktaya gelince Stop'u girişe çek
+            # 1. BAŞA BAŞA ÇEKME (Break-Even)
             if current_profit_atr >= be_trigger:
                 if p_type == "LONG": current_sl = max(current_sl, entry_p)
                 else: current_sl = min(current_sl, entry_p)
 
-            # 2. TRAILING STOP LOGIC
-            if p_type == "LONG":
-                new_sl = c['Close'] - (c['ATR_14'] * trailing_factor)
-                if new_sl > current_sl: current_sl = new_sl
-                if c['Low'] <= current_sl: res, exit_p = "STOP/BE", current_sl
-                elif c['High'] >= tp: res, exit_p = "WIN", tp
-            else:
-                new_sl = c['Close'] + (c['ATR_14'] * trailing_factor)
-                if new_sl < current_sl: current_sl = new_sl
-                if c['High'] >= current_sl: res, exit_p = "STOP/BE", current_sl
-                elif c['Low'] <= tp: res, exit_p = "WIN", tp
+            # 2. ERKEN ÇIKIŞ (Scalper Logic): Trend terse dönerse kârı al
+            if use_early_exit:
+                if p_type == "LONG" and c[e_f] < c[e_s]:
+                    res, exit_p = "SCALP/EXIT", c['Close']
+                elif p_type == "SHORT" and c[e_f] > c[e_s]:
+                    res, exit_p = "SCALP/EXIT", c['Close']
+
+            # 3. TAKİP EDEN STOP VE HEDEFLER
+            if not res:
+                if p_type == "LONG":
+                    new_sl = c['Close'] - (c['ATR_14'] * trailing_factor)
+                    if new_sl > current_sl: current_sl = new_sl
+                    if c['Low'] <= current_sl: res, exit_p = "STOP/BE", current_sl
+                    elif c['High'] >= tp: res, exit_p = "WIN", tp
+                else:
+                    new_sl = c['Close'] + (c['ATR_14'] * trailing_factor)
+                    if new_sl < current_sl: current_sl = new_sl
+                    if c['High'] >= current_sl: res, exit_p = "STOP/BE", current_sl
+                    elif c['Low'] <= tp: res, exit_p = "WIN", tp
             
             if res:
                 pnl = ((exit_p - entry_p)/entry_p)*100 if p_type == "LONG" else ((entry_p - exit_p)/entry_p)*100
@@ -112,7 +125,7 @@ def run_elite_backtest(df_15m, df_1h, target_trades, fast_ema, slow_ema, adx_thr
 # ANA PANEL
 # ==========================================
 def main():
-    st.title("QUANT LAB V6.4 // PROFIT HARVESTER")
+    st.title("QUANT LAB V6.5 // SCALPER PRO")
     
     with st.sidebar:
         st.header("SİSTEM KONTROLÜ")
@@ -123,15 +136,16 @@ def main():
         s_ema = st.slider("Yavaş EMA", 10, 200, 21)
         adx_t = st.slider("ADX Filtresi", 0, 40, 15)
         
-        st.subheader("Hasat Ayarları (TP)")
-        tp_mult = st.slider("Kâr Al (ATR x)", 1.5, 6.0, 2.5, help="NVDA için 2.5-3.0 önerilir.")
-        be_trig = st.slider("Başa Baş Çekme (ATR x)", 0.5, 3.0, 1.2, help="Kâr bu seviyeye gelince stopu girişe çeker.")
+        st.subheader("Scalping Ayarları")
+        use_exit = st.checkbox("Erken Çıkış (EMA Cross) Aktif", value=True)
+        tp_mult = st.slider("Maks. Hedef (ATR x)", 1.5, 6.0, 3.0)
+        be_trig = st.slider("BE Aktif Etme (ATR x)", 0.5, 3.0, 1.0)
         
-        st.subheader("Koruma Kalkanı")
-        ts_factor = st.slider("Takip Eden Stop (ATR x)", 1.0, 4.0, 1.8)
-        use_mtf = st.checkbox("Büyük Abi (1h Trend) Aktif", value=True)
+        st.subheader("Risk Kontrolü")
+        ts_factor = st.slider("Takip Eden Stop (ATR x)", 1.0, 4.0, 1.5)
+        use_mtf = st.checkbox("Büyük Abi Filtresi Aktif", value=True)
         
-        btn = st.button("HASADI BAŞLAT")
+        btn = st.button("SCALPER TESTİNİ BAŞLAT")
 
     if btn:
         try:
@@ -145,24 +159,30 @@ def main():
                 df_15m = calculate_indicators(df_15m, f_ema, s_ema)
                 df_1h = calculate_indicators(df_1h, 5, 200, is_trend_check=True)
 
-                results = run_elite_backtest(df_15m, df_1h, 20, f_ema, s_ema, adx_t, use_mtf, ts_factor, tp_mult, be_trig)
+                results = run_elite_backtest(df_15m, df_1h, 20, f_ema, s_ema, adx_t, use_mtf, ts_factor, tp_mult, be_trig, use_exit)
 
                 if not results.empty:
+                    # İstatistikler
                     wins = len(results[results['Result']=='WIN'])
+                    scalps = len(results[results['Result']=='SCALP/EXIT'])
+                    pos_trades = results[results['PnL_%'] > 0]
                     total_pnl = results['PnL_%'].sum()
+                    profit_factor = abs(results[results['PnL_%'] > 0]['PnL_%'].sum() / results[results['PnL_%'] < 0]['PnL_%'].sum()) if len(results[results['PnL_%'] < 0]) > 0 else 0
                     
-                    st.markdown("### `[HASAT SONUÇLARI]`")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Kazanma Oranı", f"%{(wins/len(results)*100):.1f}")
+                    st.markdown("### `[SCALPER PERFORMANS ANALİZİ]`")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Win Rate (Net)", f"%{(len(pos_trades)/len(results)*100):.1f}")
                     c2.metric("Net PnL", f"%{total_pnl:.2f}")
-                    c3.metric("Kurtarılan İşlem", len(results[results['Result']=='STOP/BE']))
+                    c3.metric("Erken Hasat (Scalp)", scalps)
+                    c4.metric("Profit Factor", f"{profit_factor:.2f}")
 
+                    # Kümülatif Kâr Grafiği
                     results['Cum_PnL'] = results['PnL_%'].cumsum()
-                    fig = go.Figure(go.Scatter(x=results['Date'], y=results['Cum_PnL'], line=dict(color='#00FF41', width=3)))
-                    fig.update_layout(title=f"{sym} Kümülatif Getiri", template="plotly_dark", height=300)
+                    fig = go.Figure(go.Scatter(x=results['Date'], y=results['Cum_PnL'], line=dict(color='#00FF41', width=3), fill='tozeroy'))
+                    fig.update_layout(title=f"{sym} Kâr Eğrisi", template="plotly_dark", height=300)
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    st.dataframe(results.tail(10))
+                    st.dataframe(results.tail(15))
                 else:
                     st.warning("Trend bulunamadı. Ayarları gevşetebilirsiniz.")
         except Exception as e:
