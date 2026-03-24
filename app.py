@@ -8,11 +8,18 @@ import os
 import time
 from datetime import datetime
 import threading
+import logging
 
 # ==========================================
-# SAYFA AYARLARI
+# 🛡️ SİSTEM GÜNLÜĞÜ (ENTERPRISE LOGGING)
 # ==========================================
-st.set_page_config(page_title="CLOUD SENTINEL V8.6 FINAL", layout="wide")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ==========================================
+# 🎨 UI & TEMA AYARLARI
+# ==========================================
+st.set_page_config(page_title="QUANT OMNI V9.8 ENT", layout="wide")
 
 st.markdown("""
     <style>
@@ -21,456 +28,327 @@ st.markdown("""
     .online { background-color: #00FF4122; color: #00FF41; border: 1px solid #00FF41; }
     .offline { background-color: #FF003C22; color: #FF003C; border: 1px solid #FF003C; }
     .stMetric { background-color: #1A1D23; border: 1px solid #333; border-radius: 12px; padding: 20px; }
-    .trade-card { background-color: #1A1D23; border-left: 5px solid #00FF41; padding: 15px; border-radius: 8px; margin-bottom: 10px; }
-    .trade-card-short { border-left: 5px solid #FF003C; }
-    .grid-card { background-color: #1A1D23; border-left: 5px solid #00FFFF; padding: 15px; border-radius: 8px; margin-bottom: 10px; }
     h1, h2, h3 { color: #00FF41 !important; }
-    .grid-title { color: #00FFFF !important; }
     </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. BULUT BAĞLANTISI
+# ☁️ FIREBASE SINGLETON (ZIRHLI BAĞLANTI)
 # ==========================================
-def init_firebase():
+@st.cache_resource
+def get_db():
     if not firebase_admin._apps:
         try:
             fb_config_str = os.environ.get('FIREBASE_CONFIG', '').strip()
-            if not fb_config_str: return None, "⚠️ BAĞLANTI YOK"
+            if not fb_config_str: return None
             fb_config = json.loads(fb_config_str)
-            cred = credentials.Certificate(fb_config)
-            firebase_admin.initialize_app(cred)
-            return firestore.client(), "BAĞLI"
+            if "project_id" in fb_config:
+                cred = credentials.Certificate(fb_config)
+                firebase_admin.initialize_app(cred)
+            else:
+                firebase_admin.initialize_app(options=fb_config)
         except Exception as e:
-            return None, f"❌ SİSTEM HATASI: {str(e)}"
-    return firestore.client(), "BAĞLI"
+            logger.error(f"Firebase Init Error: {e}")
+            return None
+    return firestore.client()
 
-db, status_msg = init_firebase()
-app_id = os.environ.get('APP_ID', 'quant-lab-v8')
+db = get_db()
+app_id = os.environ.get('APP_ID', 'quant-lab-v9-ent')
 
-# ==========================================
-# 2. BULUT KONFİGÜRASYONU YÖNETİMİ
-# ==========================================
-# --- TREND BOT (ANA BÖLÜK - 4.000$ KAPASİTE) ---
-default_config = {
-    'margin': 400, 'leverage': 3, 'timeframe': '1h',
-    'coins': ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-    'ema_f': 21, 'ema_s': 55, 'tp_atr': 3.5, 'autopilot': False
-}
-
-def get_cloud_config():
-    if not db: return default_config
-    doc = db.collection('artifacts').document(app_id).collection('public').document('config').get()
-    if doc.exists: return doc.to_dict()
-    db.collection('artifacts').document(app_id).collection('public').document('config').set(default_config)
-    return default_config
-
-# --- GRID BOT (KARINCA BÖLÜK - 6.000$ KAPASİTE: 120$ x 50 Ağ) ---
-default_grid_config = {
-    'coin': "BTCUSDT", 'grid_spacing_pct': 0.5,
-    'margin_per_grid': 120, 'max_grids': 50, 'autopilot': False
-}
-
-def get_grid_config():
-    if not db: return default_grid_config
-    doc = db.collection('artifacts').document(app_id).collection('public').document('config_grid').get()
-    if doc.exists: return doc.to_dict()
-    db.collection('artifacts').document(app_id).collection('public').document('config_grid').set(default_grid_config)
-    return default_grid_config
+# RULE 1: STRICT PATHS
+def get_data_ref(collection_name):
+    return db.collection('artifacts').document(app_id).collection('public').document('data').collection(collection_name)
 
 # ==========================================
-# 3. GERÇEK 7/24 ARKA PLAN MOTORLARI (DAEMON)
+# 📊 BINANCE VERİ MOTORU (ZIRHLI)
 # ==========================================
-# 3A. TREND MOTORU (Mevcut Balina)
+def fetch_klines(symbol, interval, limit=100):
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200: return pd.DataFrame()
+        
+        try:
+            raw = res.json()
+        except ValueError:
+            return pd.DataFrame()
+            
+        if not isinstance(raw, list) or len(raw) < 2: return pd.DataFrame()
+        
+        df = pd.DataFrame(raw, columns=['T', 'O', 'H', 'L', 'C', 'V', 'CT', 'QV', 'NT', 'TBV', 'TBQV', 'I'])
+        df[['O', 'H', 'L', 'C', 'V']] = df[['O', 'H', 'L', 'C', 'V']].apply(pd.to_numeric)
+        return df
+    except Exception as e:
+        logger.error(f"API Error ({symbol}): {e}")
+        return pd.DataFrame()
+
+# ==========================================
+# ⚙️ ARKA PLAN MOTORLARI (DAEMONS)
+# ==========================================
+
+# 1. TREND MOTORU (WHALE)
 @st.cache_resource
-def start_background_daemon():
-    def run_bot():
-        time.sleep(5)
-        try: db_t = firestore.client()
-        except: return
-
+def whale_engine():
+    def task():
+        logger.info("🐳 Whale Motoru Başlatıldı")
         while True:
             try:
-                cfg_doc = db_t.collection('artifacts').document(app_id).collection('public').document('config').get()
-                if not cfg_doc.exists:
-                    time.sleep(30); continue
+                if not db: break
+                doc = get_data_ref('configs').document('trend').get()
+                configs = doc.to_dict() if doc.exists else {}
+                
+                if configs and configs.get('autopilot', False):
+                    coins = configs.get('coins', [])
+                    timeframe = configs.get('timeframe', '1h')
+                    ema_f_period = configs.get('ema_f', 9)
+                    ema_s_period = configs.get('ema_s', 21)
+                    margin = configs.get('margin', 300)
+                    leverage = configs.get('leverage', 3)
+                    tp_atr = configs.get('tp_atr', 3.5)
 
-                cfg = cfg_doc.to_dict()
-                coins = cfg.get('coins', [])
-                timeframe = cfg.get('timeframe', '1h')
-                f_ema = cfg.get('ema_f', 21)
-                s_ema = cfg.get('ema_s', 55)
-                tp_atr = cfg.get('tp_atr', 3.5)
-                margin = cfg.get('margin', 400)
-                leverage = cfg.get('leverage', 3)
-                autopilot = cfg.get('autopilot', False)
-
-                live_data = []
-
-                for coin in coins:
-                    try:
-                        url = f"https://api.binance.com/api/v3/klines?symbol={coin}&interval={timeframe}&limit=100"
-                        res = requests.get(url, timeout=10).json()
-                        if not isinstance(res, list) or len(res) < 50: continue
-
-                        closes = pd.Series([float(k[4]) for k in res])
-                        highs = pd.Series([float(k[2]) for k in res])
-                        lows = pd.Series([float(k[3]) for k in res])
-
-                        price = closes.iloc[-1]
-                        ema_f_s = closes.ewm(span=f_ema, adjust=False).mean()
-                        ema_s_s = closes.ewm(span=s_ema, adjust=False).mean()
-
-                        last_f, last_s = ema_f_s.iloc[-1], ema_s_s.iloc[-1]
-                        prev_f, prev_s = ema_f_s.iloc[-2], ema_s_s.iloc[-2]
-
-                        tr = pd.concat([highs - lows, (highs - closes.shift()).abs(), (lows - closes.shift()).abs()], axis=1).max(axis=1)
-                        atr = tr.rolling(14).mean().iloc[-1]
-                        trend = "YUKARI" if last_f > last_s else "AŞAĞI"
-
-                        pos_ref = db_t.collection('artifacts').document(app_id).collection('public').document('active_trades').collection('positions').document(coin)
+                    for symbol in coins:
+                        df = fetch_klines(symbol, timeframe)
+                        if df.empty or len(df) < ema_s_period: continue
+                        
+                        ema_f = df['C'].ewm(span=ema_f_period, adjust=False).mean()
+                        ema_s = df['C'].ewm(span=ema_s_period, adjust=False).mean()
+                        atr = (df['H'] - df['L']).rolling(14).mean().iloc[-1]
+                        price = df['C'].iloc[-1]
+                        
+                        pos_ref = get_data_ref('active_trades').document(f"trend_{symbol}")
                         pos_doc = pos_ref.get()
-                        active_pos = pos_doc.to_dict() if pos_doc.exists else None
-
-                        if active_pos:
-                            exit_now, result = False, ""
-                            if active_pos['type'] == 'LONG':
-                                if price <= active_pos['sl']: exit_now, result = True, "LOSS"
-                                elif price >= active_pos['tp']: exit_now, result = True, "WIN"
+                        
+                        if pos_doc.exists:
+                            p = pos_doc.to_dict()
+                            res = ""
+                            p_sl = p.get('sl', 0)
+                            p_tp = p.get('tp', 0)
+                            p_entry = p.get('entry', price)
+                            p_type = p.get('type', 'LONG')
+                            
+                            if p_type == 'LONG':
+                                if price <= p_sl: res = "LOSS"
+                                elif price >= p_tp: res = "WIN"
                             else:
-                                if price >= active_pos['sl']: exit_now, result = True, "LOSS"
-                                elif price <= active_pos['tp']: exit_now, result = True, "WIN"
-
-                            if exit_now and autopilot:
-                                raw_pnl = ((price - active_pos['entry'])/active_pos['entry'])*100 if active_pos['type'] == 'LONG' else ((active_pos['entry'] - price)/active_pos['entry'])*100
-                                lev = active_pos.get('leverage', 1)
-                                mar = active_pos.get('margin', 0)
-                                lev_pnl = raw_pnl * lev
-                                usd_pnl = (mar * lev_pnl) / 100
-
-                                db_t.collection('artifacts').document(app_id).collection('public').document('data').collection('history').add({
-                                    "symbol": coin, "type": active_pos['type'], "pnl_pct": round(lev_pnl, 2), "pnl_usd": round(usd_pnl, 2),
-                                    "margin": mar, "leverage": lev, "result": result, "time": datetime.now().isoformat()
+                                if price >= p_sl: res = "LOSS"
+                                elif price <= p_tp: res = "WIN"
+                            
+                            if res:
+                                pnl = ((price - p_entry)/p_entry*100) if p_type == 'LONG' else ((p_entry - price)/p_entry*100)
+                                get_data_ref('history').add({
+                                    'bot': 'trend', 'symbol': symbol, 'pnl_usd': round((margin * pnl * leverage)/100, 2),
+                                    'result': res, 'time': datetime.now().isoformat()
                                 })
                                 pos_ref.delete()
-                                active_pos = None
+                        else:
+                            if ema_f.iloc[-2] <= ema_s.iloc[-2] and ema_f.iloc[-1] > ema_s.iloc[-1]:
+                                pos_ref.set({'type': 'LONG', 'entry': price, 'sl': price-(atr*2), 'tp': price+(atr*tp_atr), 'margin': margin, 'leverage': leverage, 'symbol': symbol, 'time': datetime.now().isoformat()})
+                            elif ema_f.iloc[-2] >= ema_s.iloc[-2] and ema_f.iloc[-1] < ema_s.iloc[-1]:
+                                pos_ref.set({'type': 'SHORT', 'entry': price, 'sl': price+(atr*2), 'tp': price-(atr*tp_atr), 'margin': margin, 'leverage': leverage, 'symbol': symbol, 'time': datetime.now().isoformat()})
+                time.sleep(45)
+            except Exception as e:
+                logger.error(f"Whale Error: {e}")
+                time.sleep(30)
+    t = threading.Thread(target=task, daemon=True); t.start(); return t
 
-                        elif autopilot:
-                            if prev_f <= prev_s and last_f > last_s:
-                                active_pos = {"symbol": coin, "type": "LONG", "entry": price, "sl": price - (atr * 2), "tp": price + (atr * tp_atr), "margin": margin, "leverage": leverage, "timeframe": timeframe}
-                                pos_ref.set(active_pos)
-                            elif prev_f >= prev_s and last_f < last_s:
-                                active_pos = {"symbol": coin, "type": "SHORT", "entry": price, "sl": price + (atr * 2), "tp": price - (atr * tp_atr), "margin": margin, "leverage": leverage, "timeframe": timeframe}
-                                pos_ref.set(active_pos)
-
-                        p_pct, p_usd = 0.0, 0.0
-                        if active_pos:
-                            raw_pnl = ((price - active_pos['entry'])/active_pos['entry'])*100 if active_pos['type'] == 'LONG' else ((active_pos['entry'] - price)/active_pos['entry'])*100
-                            p_pct = raw_pnl * active_pos.get('leverage', 1)
-                            p_usd = (active_pos.get('margin', 0) * p_pct) / 100
-
-                        live_data.append({"Varlık": coin, "Fiyat ($)": round(price, 4), "Trend": trend, "Durum": f"İŞLEMDE: {active_pos['type']} ({active_pos.get('leverage',1)}x)" if active_pos else "Pusu Modu", "Anlık PnL (%)": round(p_pct, 2) if active_pos else 0.0, "Kâr/Zarar ($)": round(p_usd, 2) if active_pos else 0.0})
-                    except: pass
-
-                db_t.collection('artifacts').document(app_id).collection('public').document('live_market').set({'data': live_data, 'updated_at': datetime.now().strftime("%H:%M:%S")})
-            except: pass
-            time.sleep(30) 
-
-    t = threading.Thread(target=run_bot, daemon=True)
-    t.start()
-    return t
-
-# 3B. GRID (IZGARA) MOTORU - (Kesin Bağlandı)
+# 2. GRID MOTORU (ANT)
 @st.cache_resource
-def start_grid_daemon():
-    def run_grid():
-        time.sleep(15) 
-        try: db_g = firestore.client()
-        except: return
-
+def ant_engine():
+    def task():
+        logger.info("🐜 Ant Motoru Başlatıldı")
         while True:
             try:
-                cfg_doc = db_g.collection('artifacts').document(app_id).collection('public').document('config_grid').get()
-                if not cfg_doc.exists:
-                    time.sleep(30); continue
-
-                cfg = cfg_doc.to_dict()
-                if not cfg.get('autopilot', False):
-                    time.sleep(30); continue
-
-                coin = cfg.get('coin', 'BTCUSDT')
-                spacing_pct = cfg.get('grid_spacing_pct', 0.5)
-                margin = cfg.get('margin_per_grid', 120)
-                max_grids = cfg.get('max_grids', 50)
-
-                url = f"https://api.binance.com/api/v3/ticker/price?symbol={coin}"
-                res = requests.get(url, timeout=10).json()
-                price = float(res['price'])
-
-                state_ref = db_g.collection('artifacts').document(app_id).collection('public').document('grid_state')
-                state_doc = state_ref.get()
-                state = state_doc.to_dict() if state_doc.exists else {'active_grids': [], 'total_profit': 0.0}
-                active_grids = state.get('active_grids', [])
+                if not db: break
+                doc = get_data_ref('configs').document('grid').get()
+                configs = doc.to_dict() if doc.exists else {}
                 
-                grids_changed = False
-                surviving_grids = []
+                if configs and configs.get('autopilot', False):
+                    symbol = configs.get('coin', 'BTCUSDT')
+                    spacing = configs.get('grid_spacing_pct', 0.5)
+                    margin = configs.get('margin_per_grid', 100)
+                    max_grids = configs.get('max_grids', 50)
 
-                # 1. SATIŞ KONTROLÜ (Hedefe ulaşan parça satılır)
-                for grid in active_grids:
-                    entry = grid['entry']
-                    profit_target = entry * (1 + (spacing_pct / 100))
+                    res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=10)
+                    if res.status_code == 200:
+                        price = float(res.json().get('price', 0))
+                        if price > 0:
+                            state_ref = get_data_ref('states').document('grid')
+                            state_doc = state_ref.get()
+                            state = state_doc.to_dict() if state_doc.exists else {'grids': [], 'total_profit': 0.0}
+                            
+                            grids = state.get('grids', [])
+                            new_grids = []
+                            total_prof = state.get('total_profit', 0.0)
+                            
+                            for g in grids:
+                                g_entry = g.get('entry', price)
+                                if price >= g_entry * (1 + spacing/100):
+                                    profit = (margin * spacing) / 100
+                                    get_data_ref('history').add({
+                                        'bot': 'grid', 'symbol': symbol, 'pnl_usd': round(profit, 2), 'result': 'WIN', 'time': datetime.now().isoformat()
+                                    })
+                                    total_prof += profit
+                                else:
+                                    new_grids.append(g)
+                            
+                            if len(new_grids) < max_grids:
+                                entries = [x.get('entry', price) for x in new_grids]
+                                last_buy = min(entries) if entries else price * 1.05
+                                if price <= last_buy * (1 - spacing/100) or not new_grids:
+                                    new_grids.append({'entry': price, 'time': datetime.now().isoformat()})
+                            
+                            state_ref.set({'grids': new_grids, 'total_profit': total_prof, 'last_price': price, 'updated': datetime.now().isoformat()})
+                time.sleep(20)
+            except Exception as e:
+                logger.error(f"Ant Error: {e}")
+                time.sleep(20)
+    t = threading.Thread(target=task, daemon=True); t.start(); return t
+
+# 3. FLASH MOTORU (FALCON)
+@st.cache_resource
+def falcon_engine():
+    def task():
+        logger.info("⚡ Falcon Motoru Başlatıldı")
+        while True:
+            try:
+                if not db: break
+                doc = get_data_ref('configs').document('flash').get()
+                configs = doc.to_dict() if doc.exists else {}
+                
+                if configs and configs.get('autopilot', False):
+                    vol_spike_threshold = configs.get('vol_spike', 5.0)
                     
-                    if price >= profit_target:
-                        profit_usd = margin * (spacing_pct / 100)
-                        state['total_profit'] = state.get('total_profit', 0.0) + profit_usd
-                        
-                        db_g.collection('artifacts').document(app_id).collection('public').document('data').collection('grid_history').add({
-                            "symbol": coin, "entry": entry, "exit": price, 
-                            "profit_usd": round(profit_usd, 2), "time": datetime.now().isoformat()
-                        })
-                        grids_changed = True
-                    else:
-                        surviving_grids.append(grid)
-                
-                active_grids = surviving_grids
-
-                # 2. ALIŞ KONTROLÜ (Fiyat düşerse yeni parça toplanır)
-                if len(active_grids) < max_grids:
-                    if not active_grids:
-                        active_grids.append({'entry': price, 'time': datetime.now().isoformat()})
-                        grids_changed = True
-                    else:
-                        lowest_entry = min([g['entry'] for g in active_grids])
-                        buy_target = lowest_entry * (1 - (spacing_pct / 100))
-                        
-                        if price <= buy_target:
-                            active_grids.append({'entry': price, 'time': datetime.now().isoformat()})
-                            grids_changed = True
-
-                # Durum güncellendiyse Buluta yansıt
-                if grids_changed or abs(state.get('last_price', 0) - price) > (price * 0.001):
-                    state['active_grids'] = active_grids
-                    state['last_price'] = price
-                    state['updated_at'] = datetime.now().strftime("%H:%M:%S")
-                    state_ref.set(state)
-
-            except: pass
-            time.sleep(10) # Grid motoru piyasayı 10 saniyede bir tarar
-
-    t_grid = threading.Thread(target=run_grid, daemon=True)
-    t_grid.start()
-    return t_grid
-
-# MOTORLARI ATEŞLE
-if db:
-    start_background_daemon()
-    start_grid_daemon()
+                    res = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=10)
+                    if res.status_code == 200:
+                        try:
+                            ticks = res.json()
+                            spikes = [t for t in ticks if float(t.get('priceChangePercent', 0)) > vol_spike_threshold and "USDT" in t.get('symbol', '')]
+                            if spikes:
+                                top = sorted(spikes, key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)[0]
+                                get_data_ref('signals').document('flash').set({
+                                    'symbol': top['symbol'], 'change': top['priceChangePercent'], 'vol': top['quoteVolume'], 'time': datetime.now().isoformat()
+                                })
+                        except ValueError:
+                            pass
+                time.sleep(30)
+            except Exception as e:
+                logger.error(f"Falcon Error: {e}")
+                time.sleep(30)
+    t = threading.Thread(target=task, daemon=True); t.start(); return t
 
 # ==========================================
-# 4. ARAYÜZ (FRONTEND DASHBOARD)
+# 🖥️ MERKEZİ KONTROL ARAYÜZÜ
 # ==========================================
 def main():
-    st.title("🛡️ CLOUD SENTINEL V8.6 // FINAL DUAL ENGINE")
-    st.caption("Trend & Grid Motorları (10.000$ Kasa Optimizasyonu ile)")
+    st.title("🛡️ QUANT OMNI SENTINEL V9.8 ENT")
     
-    cfg = get_cloud_config()
-    grid_cfg = get_grid_config()
-    is_autopilot_on = cfg.get('autopilot', False)
-    is_grid_on = grid_cfg.get('autopilot', False)
-    
-    # MOTOR DURUMLARI
-    if status_msg == "BAĞLI":
-        motor_status = []
-        if is_autopilot_on: motor_status.append("🐳 TREND MOTORU ÇALIŞIYOR")
-        if is_grid_on: motor_status.append("🐜 GRID MOTORU ÇALIŞIYOR")
-        
-        if motor_status:
-            st.markdown(f'<div class="status-bar online">● BULUT DURUMU: {status_msg} | 🚀 AKTİF SİSTEMLER: {" | ".join(motor_status)}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="status-bar" style="background-color:#333; color:white;">● BULUT DURUMU: {status_msg} | ⏸️ TÜM MOTORLAR DURDURULDU</div>', unsafe_allow_html=True)
+    if db:
+        st.markdown(f'<div class="status-bar online">● SİSTEM ÇEVRİMİÇİ | 💠 APP_ID: {app_id}</div>', unsafe_allow_html=True)
+        whale_engine()
+        ant_engine()
+        falcon_engine()
     else:
-        st.markdown(f'<div class="status-bar offline">{status_msg}</div>', unsafe_allow_html=True)
-        return 
+        st.markdown(f'<div class="status-bar offline">❌ SİSTEM ÇEVRİMDIŞI (Firebase Ayarları Bekleniyor)</div>', unsafe_allow_html=True)
+        return
 
-    # EKRAN YÖNETİMİ
-    with st.sidebar:
-        st.markdown("### ⚙️ EKRAN YÖNETİMİ")
-        ui_refresh = st.toggle("👁️ Canlı Ekranı Yenile (10sn)", value=False, help="Otomatik sayfa yenileme")
-        st.divider()
-        st.markdown("### 💼 KASA DAĞILIMI (10k$)")
-        st.progress(0.40, text="🐳 Trend Fonu: %40 (4.000$)")
-        st.progress(0.60, text="🐜 Grid Fonu: %60 (6.000$)")
+    tabs = st.tabs(["🐳 TREND (Whale)", "🐜 GRID (Ant)", "⚡ FLASH (Falcon)", "📊 ANALYTICS"])
 
-    # ÇİFT SEKME
-    tab_trend, tab_grid = st.tabs(["🐳 TREND LABORATUVARI (Ana Bot)", "🐜 GRID FABRİKASI (Günlük Kâr)"])
+    # --- 1. TREND TAB ---
+    with tabs[0]:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            doc = get_data_ref('configs').document('trend').get()
+            cfg = doc.to_dict() if doc.exists else {}
+            with st.form("t_cfg"):
+                m = st.number_input("İşlem Marjini ($)", 10, 5000, cfg.get('margin', 300))
+                l = st.slider("Kaldıraç (x)", 1, 20, cfg.get('leverage', 3))
+                coins = st.multiselect("Varlıklar", ["BTCUSDT", "ETHUSDT", "SOLUSDT"], default=cfg.get('coins', ["BTCUSDT"]))
+                auto = st.checkbox("Otopilot (Otomatik İşlem)", value=cfg.get('autopilot', False))
+                if st.form_submit_button("Ayarları Kaydet"):
+                    get_data_ref('configs').document('trend').set({**cfg, 'margin': m, 'leverage': l, 'coins': coins, 'autopilot': auto})
+                    st.rerun()
+        with c2:
+            st.markdown("#### `🟢 AKTİF TREND İŞLEMLERİ`")
+            active = get_data_ref('active_trades').get()
+            if active: 
+                st.dataframe(pd.DataFrame([a.to_dict() for a in active]), use_container_width=True)
+            else: 
+                st.info("Otopilot sinyal arıyor...")
 
-    # ==========================================
-    # SEKME 1: TREND BOTU
-    # ==========================================
-    with tab_trend:
-        st.info("Büyük trendleri yakalar. Sadece belirlediğiniz kırılımlarda işleme girer.")
-        col_t_form, col_t_dash = st.columns([1, 3])
-        
-        with col_t_form:
-            with st.form("config_form"):
-                st.header("☁️ Trend Ayarları")
-                new_margin = st.number_input("İşlem Marjini ($)", min_value=10, max_value=10000, value=int(cfg.get('margin', 400)))
-                new_leverage = st.slider("Kaldıraç (x)", 1, 20, int(cfg.get('leverage', 3)))
-                
-                tf_options = ["15m", "1h", "4h", "1d"]
-                curr_tf = cfg.get('timeframe', '1h')
-                new_tf = st.selectbox("Zaman Dilimi", tf_options, index=tf_options.index(curr_tf) if curr_tf in tf_options else 1)
-                
-                coin_list = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "AVAXUSDT"]
-                curr_coins = cfg.get('coins', ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
-                new_coins = st.multiselect("Varlıklar", coin_list, default=[c for c in curr_coins if c in coin_list])
-                
-                new_f_ema = st.slider("Hızlı EMA", 5, 50, int(cfg.get('ema_f', 21)))
-                new_s_ema = st.slider("Yavaş EMA", 10, 200, int(cfg.get('ema_s', 55)))
-                new_tp = st.slider("Kâr Hedefi (ATR x)", 1.0, 6.0, float(cfg.get('tp_atr', 3.5)))
-                
-                st.divider()
-                st.markdown("### 🤖 Motor Kontrolü")
-                new_auto_str = st.radio("Trend Motoru:", ["AÇIK", "KAPALI"], index=0 if is_autopilot_on else 1, horizontal=True)
-                new_autopilot = True if new_auto_str == "AÇIK" else False
-                
-                if st.form_submit_button("☁️ Trendi Kaydet ve Başlat"):
-                    db.collection('artifacts').document(app_id).collection('public').document('config').set({
-                        'margin': new_margin, 'leverage': new_leverage, 'timeframe': new_tf, 'coins': new_coins, 
-                        'ema_f': new_f_ema, 'ema_s': new_s_ema, 'tp_atr': new_tp, 'autopilot': new_autopilot
-                    })
-                    st.success("Trend motoru güncellendi!")
-                    time.sleep(1); st.rerun()
+    # --- 2. GRID TAB ---
+    with tabs[1]:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            doc = get_data_ref('configs').document('grid').get()
+            cfg = doc.to_dict() if doc.exists else {}
+            with st.form("g_cfg"):
+                current_coin = cfg.get('coin', 'BTCUSDT')
+                coin = st.selectbox("Güvenli Liman", ["BTCUSDT", "ETHUSDT"], index=0 if current_coin=="BTCUSDT" else 1)
+                space = st.number_input("Izgara Aralığı (%)", 0.1, 5.0, float(cfg.get('grid_spacing_pct', 0.5)))
+                m_grid = st.number_input("Ağ Başına Bütçe ($)", 10, 500, int(cfg.get('margin_per_grid', 100)))
+                auto_g = st.checkbox("Otopilot (Otomatik Al-Sat)", value=cfg.get('autopilot', False))
+                if st.form_submit_button("Ayarları Kaydet"):
+                    get_data_ref('configs').document('grid').set({**cfg, 'coin': coin, 'grid_spacing_pct': space, 'margin_per_grid': m_grid, 'autopilot': auto_g})
+                    st.rerun()
+        with c2:
+            st.markdown("#### `🐜 ELDEKİ PARÇALAR`")
+            state = get_data_ref('states').document('grid').get()
+            if state.exists:
+                gs = state.to_dict()
+                st.metric("Kumbaradaki Net Kâr", f"${gs.get('total_profit', 0.0):.2f}")
+                if gs.get('grids'): 
+                    st.dataframe(pd.DataFrame(gs['grids']), use_container_width=True)
+            else: 
+                st.info("Grid motoru beklemede.")
 
-        with col_t_dash:
-            active_docs = db.collection('artifacts').document(app_id).collection('public').document('active_trades').collection('positions').get()
-            all_active = [doc.to_dict() for doc in active_docs]
-            
-            if all_active:
-                st.markdown("#### `🟢 AKTİF POZİSYONLAR`")
-                cols = st.columns(min(len(all_active), 4)) 
-                for idx, pos in enumerate(all_active):
-                    with cols[idx % 4]:
-                        card_class = "trade-card" if pos['type'] == 'LONG' else "trade-card trade-card-short"
-                        st.markdown(f"""
-                        <div class="{card_class}">
-                            <h4 style="margin:0;">{pos['symbol']} <span style="font-size:0.6em; color:gray;">{pos['type']}</span></h4>
-                            <p style="margin:0; font-size:12px; color:gray;">Marjin: ${pos.get('margin',0)} | {pos.get('leverage',1)}x | TF: {pos.get('timeframe', '1h')}</p>
-                            <p style="margin:0; font-size:14px; margin-top:5px;">Giriş: {pos['entry']}</p>
-                            <p style="margin:0; font-size:14px; color:#00FF41;">Hedef: {pos['tp']:.4f}</p>
-                            <p style="margin:0; font-size:14px; color:#FF003C;">Stop: {pos['sl']:.4f}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-            
-            st.divider()
-            
-            live_doc = db.collection('artifacts').document(app_id).collection('public').document('live_market').get()
-            if live_doc.exists:
-                live_data = live_doc.to_dict()
-                st.markdown(f"#### `📡 CANLI RADAR ÖZETİ` <span style='font-size:12px; color:gray;'>Güncelleme: {live_data.get('updated_at', '...')}</span>", unsafe_allow_html=True)
-                df_live = pd.DataFrame(live_data.get('data', []))
-                if not df_live.empty:
-                    def highlight_pnl(val): return 'color: #00FF41; font-weight: bold;' if val > 0 else '#FF003C; font-weight: bold;' if val < 0 else 'gray'
-                    try: st.dataframe(df_live.style.map(highlight_pnl, subset=['Anlık PnL (%)', 'Kâr/Zarar ($)']), width='stretch')
-                    except:
-                        try: st.dataframe(df_live.style.applymap(highlight_pnl, subset=['Anlık PnL (%)', 'Kâr/Zarar ($)']), width='stretch')
-                        except: st.dataframe(df_live, width='stretch')
-            
-            hist_docs = db.collection('artifacts').document(app_id).collection('public').document('data').collection('history').get()
-            history = [d.to_dict() for d in hist_docs]
-            if history:
-                st.divider()
-                total_trades = len(history)
-                wins = len([h for h in history if 'WIN' in str(h.get('result', '')).upper()])
-                win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
-                total_pnl_usd = sum([h.get('pnl_usd', 0) for h in history])
-                
-                st.markdown("#### `🏆 TREND İSTATİSTİKLERİ`")
-                c_hist1, c_hist2, c_hist3 = st.columns(3)
-                c_hist1.metric("Kapanan İşlem", total_trades)
-                c_hist2.metric("Kazanma Oranı", f"%{win_rate:.1f}")
-                c_hist3.metric("Net Kâr/Zarar", f"${total_pnl_usd:.2f}")
+    # --- 3. FLASH TAB ---
+    with tabs[2]:
+        st.markdown("<h2 style='color:#FFD700;'>⚡ Falcon: Hacim Avcısı</h2>", unsafe_allow_html=True)
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            doc = get_data_ref('configs').document('flash').get()
+            cfg = doc.to_dict() if doc.exists else {}
+            with st.form("f_cfg"):
+                f_s = st.slider("Hacim Patlama Eşiği (%)", 2.0, 15.0, float(cfg.get('vol_spike', 5.0)))
+                f_a = st.checkbox("Radarı Başlat", value=cfg.get('autopilot', False))
+                if st.form_submit_button("Ayarları Kaydet"):
+                    get_data_ref('configs').document('flash').set({**cfg, 'vol_spike': f_s, 'autopilot': f_a})
+                    st.rerun()
+        with c2:
+            sig = get_data_ref('signals').document('flash').get()
+            if sig.exists:
+                s = sig.to_dict()
+                st.warning(f"⚡ RADAR TESPİTİ: {s.get('symbol')} | %{s.get('change')}")
+                st.caption(f"Tespit Zamanı: {s.get('time')}")
+            else: 
+                st.info("Radar temiz, patlama bekleniyor...")
 
-    # ==========================================
-    # SEKME 2: GRID BOTU (Karınca)
-    # ==========================================
-    with tab_grid:
-        st.info("Sürekli al-sat yaparak kümülatif günlük kâr yaratır. 6.000$'lık kasa yapısına göre otomatik kalibre edilmiştir.")
-        col_g_form, col_g_dash = st.columns([1, 3])
-        
-        with col_g_form:
-            with st.form("grid_config_form"):
-                st.markdown("<h2 class='grid-title'>🐜 Karınca Ayarları</h2>", unsafe_allow_html=True)
-                
-                new_g_coin = st.selectbox("Varlık (Sadece Güvenli)", ["BTCUSDT", "ETHUSDT"], index=["BTCUSDT", "ETHUSDT"].index(grid_cfg.get('coin', 'BTCUSDT')))
-                new_g_spacing = st.number_input("Izgara Aralığı (%)", min_value=0.1, max_value=5.0, value=float(grid_cfg.get('grid_spacing_pct', 0.5)), step=0.1)
-                new_g_margin = st.number_input("Ağ Başına Bütçe ($)", min_value=10, max_value=1000, value=int(grid_cfg.get('margin_per_grid', 120)))
-                new_g_max = st.number_input("Maksimum Ağ Sayısı", min_value=1, max_value=100, value=int(grid_cfg.get('max_grids', 50)))
-                
-                st.divider()
-                st.caption(f"⚠️ Toplam Grid Kapasitesi (Risk): ${new_g_margin * new_g_max}")
-                
-                st.markdown("### 🤖 Motor Kontrolü")
-                new_g_auto_str = st.radio("Karınca (Grid) Motoru:", ["AÇIK", "KAPALI"], index=0 if is_grid_on else 1, horizontal=True)
-                new_g_autopilot = True if new_g_auto_str == "AÇIK" else False
-                
-                if st.form_submit_button("☁️ Grid'i Kaydet ve Başlat"):
-                    db.collection('artifacts').document(app_id).collection('public').document('config_grid').set({
-                        'coin': new_g_coin, 'grid_spacing_pct': new_g_spacing, 
-                        'margin_per_grid': new_g_margin, 'max_grids': new_g_max, 'autopilot': new_g_autopilot
-                    })
-                    st.success("Grid motoru başlatıldı!")
-                    time.sleep(1); st.rerun()
-
-        with col_g_dash:
-            grid_state_doc = db.collection('artifacts').document(app_id).collection('public').document('grid_state').get()
-            grid_state = grid_state_doc.to_dict() if grid_state_doc.exists else {}
+    # --- 4. ANALYTICS TAB ---
+    with tabs[3]:
+        st.markdown("### 📊 Fon Performans Analitiği")
+        hist = get_data_ref('history').get()
+        if hist:
+            # Pandas DataFrame güvenlik kontrolleri
+            df = pd.DataFrame([h.to_dict() for h in hist])
+            if 'pnl_usd' not in df.columns: df['pnl_usd'] = 0.0
+            if 'result' not in df.columns: df['result'] = 'UNKNOWN'
             
-            active_grids = grid_state.get('active_grids', [])
-            total_grid_profit = grid_state.get('total_profit', 0.0)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Toplam Net Kâr", f"${df['pnl_usd'].sum():.2f}")
+            m2.metric("Kapanan İşlem", len(df))
+            wins = len(df[df['result'] == 'WIN'])
+            m3.metric("Başarı Oranı", f"%{(wins/max(len(df), 1))*100:.1f}")
             
-            c_g1, c_g2, c_g3 = st.columns(3)
-            c_g1.metric("Toplanan Net Kâr", f"${total_grid_profit:.2f}")
-            c_g2.metric("Açık Ağ Sayısı", f"{len(active_grids)} / {grid_cfg.get('max_grids', 50)}")
-            c_g3.metric("Anlık Piyasa Fiyatı", f"${grid_state.get('last_price', 0):.2f}")
-            
-            st.divider()
-            st.markdown("#### `📦 ELDEKİ PARÇALAR`")
-            
-            if active_grids:
-                cols = st.columns(min(len(active_grids), 4))
-                for idx, grid in enumerate(sorted(active_grids, key=lambda x: x['entry'])):
-                    with cols[idx % 4]:
-                        target = grid['entry'] * (1 + (grid_cfg.get('grid_spacing_pct', 0.5) / 100))
-                        st.markdown(f"""
-                        <div class="grid-card">
-                            <h5 style="margin:0; color:gray;">Maliyet (Alış)</h5>
-                            <h3 style="margin:0;">${grid['entry']:.2f}</h3>
-                            <p style="margin:0; font-size:12px; margin-top:5px; color:#00FFFF;">Hedef: ${target:.2f}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
+            if 'time' in df.columns:
+                st.dataframe(df.sort_values('time', ascending=False), use_container_width=True)
             else:
-                st.info("Grid şu an boş. Fiyatın düşmesini bekliyor veya Otopilot kapalı.")
+                st.dataframe(df, use_container_width=True)
+        else:
+            st.info("İstatistik verisi bekleniyor. İlk işlem kapandığında burada görünecektir.")
 
-            grid_hist_docs = db.collection('artifacts').document(app_id).collection('public').document('data').collection('grid_history').get()
-            grid_history = [d.to_dict() for d in grid_hist_docs]
-            
-            if grid_history:
-                st.divider()
-                st.markdown("#### `💰 KUMBARA (KAPANAN İŞLEMLER)`")
-                df_grid_hist = pd.DataFrame(grid_history)
-                display_cols = ['time', 'symbol', 'entry', 'exit', 'profit_usd']
-                display_cols = [c for c in display_cols if c in df_grid_hist.columns]
-                
-                def highlight_grid_profit(val): return 'color: #00FF41; font-weight: bold;' if isinstance(val, (int, float)) and val > 0 else ''
-                
-                try: st.dataframe(df_grid_hist[display_cols].sort_values('time', ascending=False).head(10).style.map(highlight_grid_profit, subset=['profit_usd']), width='stretch')
-                except:
-                    try: st.dataframe(df_grid_hist[display_cols].sort_values('time', ascending=False).head(10).style.applymap(highlight_grid_profit, subset=['profit_usd']), width='stretch')
-                    except: st.dataframe(df_grid_hist[display_cols].sort_values('time', ascending=False).head(10), width='stretch')
-
-    if ui_refresh:
-        time.sleep(10); st.rerun()
+    # Canlı UI Yenileme
+    time.sleep(10)
+    st.rerun()
 
 if __name__ == "__main__":
     main()
