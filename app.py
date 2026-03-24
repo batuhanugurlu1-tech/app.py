@@ -5,14 +5,17 @@ import { getFirestore, collection, doc, setDoc, addDoc, onSnapshot, query, limit
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { Shield, TrendingUp, Activity, History, Settings, RefreshCcw, Zap, Target, Lock } from 'lucide-react';
 
-// --- CONFIGURATION & FIREBASE SETUP ---
+// --- ADIM 1: BULUT DEFTERİ (FIREBASE) BAĞLANTISI ---
+// Bu kısım, botun "hafızasını" internete bağlar. 
+// Bilgisayarın kapansa bile işlemlerin burada saklanır.
 const firebaseConfig = JSON.parse(window.__firebase_config || '{}');
 const appId = typeof window.__app_id !== 'undefined' ? window.__app_id : 'quant-lab-v7';
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-// --- TECHNICAL ANALYSIS UTILS ---
+// --- YARDIMCI MATEMATİK FONKSİYONU ---
+// Fiyatların ortalamasını alarak trendi hesaplamamıza yardım eder.
 const calculateEMA = (data, period) => {
   const k = 2 / (period + 1);
   let ema = [data[0]];
@@ -23,16 +26,18 @@ const calculateEMA = (data, period) => {
 };
 
 export default function App() {
+  // --- ADIM 2: BOTUN DURUM DEĞİŞKENLERİ ---
   const [user, setUser] = useState(null);
-  const [symbol, setSymbol] = useState('BTCUSDT');
-  const [price, setPrice] = useState(0);
-  const [history, setHistory] = useState([]);
-  const [currentPos, setCurrentPos] = useState(null);
-  const [isBotRunning, setIsBotRunning] = useState(true);
+  const [symbol, setSymbol] = useState('BTCUSDT'); // Hangi coin'e bakıyoruz?
+  const [price, setPrice] = useState(0);           // Şu anki fiyat ne?
+  const [history, setHistory] = useState([]);      // Eski kâr/zararlarımız
+  const [currentPos, setCurrentPos] = useState(null); // Şu an açık işlem var mı?
+  const [isBotRunning, setIsBotRunning] = useState(true); // Bot çalışıyor mu?
   const [lastCheck, setLastCheck] = useState(null);
   const [settings] = useState({ emaF: 9, emaS: 21, adxT: 15, tp: 4.5 });
 
-  // 1. Auth & Initial Load
+  // --- ADIM 3: BULUTTA OTURUM AÇMA ---
+  // Uygulama açıldığında Firebase'e "ben geldim" der.
   useEffect(() => {
     const initAuth = async () => {
       if (typeof window.__initial_auth_token !== 'undefined' && window.__initial_auth_token) {
@@ -46,11 +51,12 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // 2. Real-time Firestore Sync (Trades & Position)
+  // --- ADIM 4: DEFTERİ (VERİTABANINI) CANLI İZLE ---
+  // Veritabanında bir değişiklik (yeni işlem) olduğunda ekranı günceller.
   useEffect(() => {
     if (!user) return;
 
-    // Trade History Listener
+    // Geçmiş işlemleri buluttan getir
     const tradesRef = collection(db, 'artifacts', appId, 'users', user.uid, 'trade_history');
     const q = query(tradesRef, orderBy('timestamp', 'desc'), limit(20));
     const unsubscribeHistory = onSnapshot(q, (snapshot) => {
@@ -58,7 +64,7 @@ export default function App() {
       setHistory(data);
     }, (err) => console.error("History Error:", err));
 
-    // Active Position Listener
+    // Aktif pozisyonu buluttan getir
     const activePosRef = doc(db, 'artifacts', appId, 'users', user.uid, 'active_position', 'current');
     const unsubscribeActive = onSnapshot(activePosRef, (snapshot) => {
       if (snapshot.exists()) {
@@ -75,17 +81,19 @@ export default function App() {
     };
   }, [user]);
 
-  // 3. Main Bot Loop (Every 10 seconds)
+  // --- ADIM 5: ANA DÖNGÜ (HER 10 SANİYEDE BİR ÇALIŞIR) ---
+  // Botun "kalp atışı" burasıdır. Sürekli fiyatı kontrol eder.
   useEffect(() => {
     const mainLoop = async () => {
       try {
-        // Fetch Current Price
+        // Binance'den en son fiyatı al
         const priceRes = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
         const priceData = await priceRes.json();
         const currentPrice = parseFloat(priceData.price);
         setPrice(currentPrice);
         setLastCheck(new Date().toLocaleTimeString());
 
+        // Bot çalışıyorsa ve kullanıcı giriş yapmışsa işlem mantığını çalıştır
         if (isBotRunning && user) {
           await runTradingLogic(currentPrice);
         }
@@ -98,8 +106,9 @@ export default function App() {
     return () => clearInterval(interval);
   }, [symbol, currentPos, isBotRunning, user]);
 
+  // --- ADIM 6: İŞLEM MANTIĞI (BEYİN) ---
   const runTradingLogic = async (p) => {
-    // A. POZİSYON KAPATMA KONTROLÜ
+    // A. EĞER İŞLEMDEYSEK: KAR AL VEYA ZARAR KES NOKTASINA GELDİK Mİ?
     if (currentPos) {
       let exit = false;
       let result = "";
@@ -117,17 +126,18 @@ export default function App() {
           ? ((p - currentPos.entry) / currentPos.entry) * 100 
           : ((currentPos.entry - p) / currentPos.entry) * 100;
 
+        // İşlemi geçmişe (buluta) kaydet
         await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'trade_history'), {
           symbol, type: currentPos.type, entry: currentPos.entry, exit: p,
           pnl: pnl.toFixed(2), result, timestamp: Date.now()
         });
+        // Aktif pozisyonu (buluttan) sil
         await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'active_position', 'current'), {});
       }
       return;
     }
 
-    // B. YENİ POZİSYON AÇMA (Indicator Analysis)
-    // 15m candle verisi çekilir
+    // B. EĞER İŞLEMDE DEĞİLSEK: YENİ FIRSAT VAR MI?
     const klinesRes = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=15m&limit=100`);
     const klines = await klinesRes.json();
     const closes = klines.map(k => parseFloat(k[4]));
@@ -142,17 +152,16 @@ export default function App() {
     const prevF = emaF[emaF.length - 2];
     const prevS = emaS[emaS.length - 2];
 
-    // ATR Hesabı (Basitleştirilmiş)
     const atr = (highs[highs.length-1] - lows[lows.length-1]);
 
-    // Trend ve Kesişim Kontrolü
-    if (prevF <= prevS && lastF > lastS) { // LONG Cross
+    // Kesişim (Cross) Kontrolü
+    if (prevF <= prevS && lastF > lastS) { // YUKARI KESİŞİM
       const sl = p - (atr * 2);
       const tp = p + (atr * settings.tp);
       await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'active_position', 'current'), {
         type: 'LONG', entry: p, sl, tp, timestamp: Date.now(), symbol
       });
-    } else if (prevF >= prevS && lastF < lastS) { // SHORT Cross
+    } else if (prevF >= prevS && lastF < lastS) { // AŞAĞI KESİŞİM
       const sl = p + (atr * 2);
       const tp = p - (atr * settings.tp);
       await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'active_position', 'current'), {
@@ -161,6 +170,7 @@ export default function App() {
     }
   };
 
+  // --- İSTATİSTİK HESAPLAMALARI ---
   const winRate = useMemo(() => {
     if (history.length === 0) return 0;
     const wins = history.filter(h => h.result === 'WIN').length;
@@ -171,9 +181,10 @@ export default function App() {
     return history.reduce((acc, curr) => acc + parseFloat(curr.pnl), 0).toFixed(2);
   }, [history]);
 
+  // --- ADIM 7: ARAYÜZ (TASARIM) ---
   return (
     <div className="min-h-screen bg-[#0E1117] text-white p-4 font-sans selection:bg-[#00FF41]/30">
-      {/* TOP BAR */}
+      {/* ÜST BİLGİ ÇUBUĞU */}
       <div className="max-w-7xl mx-auto flex flex-col md:flex-row justify-between items-center mb-8 gap-4 bg-[#1A1D23] p-6 rounded-3xl border border-gray-800 shadow-2xl">
         <div className="flex items-center gap-4">
           <div className="bg-[#00FF41]/10 p-3 rounded-2xl">
@@ -203,10 +214,10 @@ export default function App() {
       </div>
 
       <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* LEFT COLUMN: ACTIVE STATUS */}
+        {/* SOL KOLON: ÖZET VE CANLI POZİSYON */}
         <div className="lg:col-span-2 space-y-8">
           
-          {/* STATS OVERVIEW */}
+          {/* İSTATİSTİKLER */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="bg-[#1A1D23] p-6 rounded-3xl border border-gray-800">
               <div className="text-gray-500 text-xs font-bold uppercase mb-1">Win Rate</div>
@@ -222,7 +233,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* ACTIVE POSITION MONITOR */}
+          {/* AKTİF POZİSYON KARTI */}
           <div className="bg-[#1A1D23] rounded-3xl border-2 border-[#00FF41]/20 p-8 relative overflow-hidden shadow-2xl shadow-[#00FF41]/5">
             <div className="flex justify-between items-center mb-8">
               <h2 className="text-xl font-black flex items-center gap-3">
@@ -261,14 +272,14 @@ export default function App() {
             ) : (
               <div className="py-12 text-center text-gray-600">
                 <p className="text-lg font-bold mb-2">Şu an açık pozisyon yok.</p>
-                <p className="text-sm opacity-50 italic">Bot, EMA 9/21 kesişimi ve ATR onayı bekliyor...</p>
+                <p className="text-sm opacity-50 italic">Sinyal bekliyor...</p>
               </div>
             )}
             
             <div className="absolute -bottom-12 -right-12 w-48 h-48 bg-[#00FF41]/5 rounded-full blur-3xl"></div>
           </div>
 
-          {/* HISTORY TABLE */}
+          {/* GEÇMİŞ İŞLEMLER TABLOSU */}
           <div className="bg-[#1A1D23] rounded-3xl border border-gray-800 overflow-hidden shadow-xl">
             <div className="p-6 border-b border-gray-800 flex justify-between items-center bg-[#1A1D23]">
               <h2 className="font-black flex items-center gap-3"><History /> BULUT İŞLEM GEÇMİŞİ</h2>
@@ -308,7 +319,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* RIGHT COLUMN: CONFIGURATION */}
+        {/* SAĞ KOLON: AYARLAR */}
         <div className="space-y-8">
           <div className="bg-[#1A1D23] rounded-3xl border border-gray-800 p-8 shadow-xl">
             <h2 className="font-black mb-6 flex items-center gap-3"><Settings className="text-[#00FF41]" /> BOT KONTROL</h2>
@@ -346,17 +357,13 @@ export default function App() {
                   </div>
                 </div>
               </div>
-
-              <div className="text-[10px] text-gray-500 text-center italic leading-relaxed">
-                Bu uygulama senkronize çalışır. Tarayıcıyı kapatsanız dahi, Railway üzerindeki sunucunuz aktif pozisyonları takip etmeye devam edebilir.
-              </div>
             </div>
           </div>
 
           <div className="bg-gradient-to-br from-[#00FF41]/10 to-transparent rounded-3xl border border-[#00FF41]/20 p-8">
              <h2 className="font-black mb-4 flex items-center gap-3 text-[#00FF41]"><Zap size={20} /> EKİP NOTU</h2>
              <p className="text-xs text-gray-400 leading-relaxed">
-                Şu an "Sanal Portföy" modundasın. Bot, bulut veritabanını kullanarak işlemlerini gerçek fiyatlarla simüle ediyor. Başarı oranını (Win Rate) buradan canlı izleyebilirsin.
+                Bu uygulama sanal bir portföydür. Kazançlar gerçek fiyatlarla hesaplanır ancak cüzdanınızdan para çıkmaz. Önce stratejiyi kanıtlayalım!
              </p>
           </div>
         </div>
