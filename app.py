@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # 🎨 UI & TEMA AYARLARI
 # ==========================================
-st.set_page_config(page_title="QUANT OMNI V9.9 PRIME", layout="wide")
+st.set_page_config(page_title="QUANT OMNI V9.10 PRIME", layout="wide")
 
 st.markdown("""
     <style>
@@ -60,29 +60,24 @@ def get_data_ref(collection_name):
     return db.collection('artifacts').document(app_id).collection('public').document('data').collection(collection_name)
 
 # ==========================================
-# 📊 BİLİMSEL İNDİKATÖR MOTORU (RESTORE EDİLDİ)
+# 📊 BİLİMSEL İNDİKATÖR MOTORU
 # ==========================================
 def calculate_advanced_indicators(df, fast_ema, slow_ema):
     if df.empty or len(df) < slow_ema: return df
     
-    # EMA'lar
     df['EMA_F'] = df['C'].ewm(span=fast_ema, adjust=False).mean()
     df['EMA_S'] = df['C'].ewm(span=slow_ema, adjust=False).mean()
     
-    # RSI (14)
     delta = df['C'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     df['RSI'] = 100 - (100 / (1 + (gain / loss)))
     
-    # Gerçek ATR (True Range)
     tr = pd.concat([df['H']-df['L'], np.abs(df['H']-df['C'].shift()), np.abs(df['L']-df['C'].shift())], axis=1).max(axis=1)
     df['ATR'] = tr.ewm(alpha=1/14, adjust=False).mean()
     
-    # ADX (Trend Gücü Kalkanı)
     up_move = df['H'] - df['H'].shift(1)
     down_move = df['L'].shift(1) - df['L']
-    
     plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
     minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
     
@@ -99,10 +94,8 @@ def fetch_klines(symbol, interval, limit=100):
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
         res = requests.get(url, timeout=10)
         if res.status_code != 200: return pd.DataFrame()
-        
         try: raw = res.json()
         except ValueError: return pd.DataFrame()
-            
         if not isinstance(raw, list) or len(raw) < 2: return pd.DataFrame()
         
         df = pd.DataFrame(raw, columns=['T', 'O', 'H', 'L', 'C', 'V', 'CT', 'QV', 'NT', 'TBV', 'TBQV', 'I'])
@@ -113,10 +106,10 @@ def fetch_klines(symbol, interval, limit=100):
         return pd.DataFrame()
 
 # ==========================================
-# ⚙️ ARKA PLAN MOTORLARI (ESKİ ZEKAYA KAVUŞTU)
+# ⚙️ ARKA PLAN MOTORLARI
 # ==========================================
 
-# 1. TREND MOTORU (WHALE) - ADX/RSI KALKANI EKLENDİ
+# 1. TREND MOTORU (WHALE)
 @st.cache_resource
 def whale_engine():
     def task():
@@ -173,7 +166,6 @@ def whale_engine():
                                 })
                                 pos_ref.delete()
                         else:
-                            # 🛡️ ADX & RSI KALKANLI İŞLEME GİRİŞ (V5.2 ZEKASI)
                             if prev['EMA_F'] <= prev['EMA_S'] and current['EMA_F'] > current['EMA_S'] and current['RSI'] > 50 and current['ADX'] >= adx_threshold:
                                 pos_ref.set({'type': 'LONG', 'entry': price, 'sl': price-(current['ATR']*2), 'tp': price+(current['ATR']*tp_atr), 'margin': margin, 'leverage': leverage, 'symbol': symbol, 'time': datetime.now().isoformat()})
                             elif prev['EMA_F'] >= prev['EMA_S'] and current['EMA_F'] < current['EMA_S'] and current['RSI'] < 50 and current['ADX'] >= adx_threshold:
@@ -258,7 +250,6 @@ def falcon_engine():
                     pos_ref = get_data_ref('active_trades').document('flash_pos')
                     pos_doc = pos_ref.get()
 
-                    # AKTİF İŞLEM VARSA TAKİP ET
                     if pos_doc.exists:
                         p = pos_doc.to_dict()
                         symbol = p.get('symbol')
@@ -277,7 +268,6 @@ def falcon_engine():
                                 })
                                 pos_ref.delete()
                     else:
-                        # YENİ SİNYAL ARA VE İŞLEME GİR
                         res = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=10)
                         if res.status_code == 200:
                             try:
@@ -311,7 +301,7 @@ def falcon_engine():
 # 🖥️ MERKEZİ KONTROL ARAYÜZÜ
 # ==========================================
 def main():
-    st.title("🛡️ QUANT OMNI SENTINEL V9.9 PRIME")
+    st.title("🛡️ QUANT OMNI SENTINEL V9.10 PRIME")
     
     if db:
         st.markdown(f'<div class="status-bar online">● SİSTEM ÇEVRİMİÇİ | 💠 APP_ID: {app_id}</div>', unsafe_allow_html=True)
@@ -335,7 +325,6 @@ def main():
                 l = st.slider("Kaldıraç (x)", 1, 20, cfg.get('leverage', 3))
                 coins = st.multiselect("Varlıklar", ["BTCUSDT", "ETHUSDT", "SOLUSDT"], default=cfg.get('coins', ["BTCUSDT"]))
                 
-                # EKSİK AYARLAR VE ZAMAN DİLİMİ GERİ GELDİ
                 tf_opts = ["15m", "1h", "4h", "1d"]
                 tf_index = tf_opts.index(cfg.get('timeframe', '1h')) if cfg.get('timeframe', '1h') in tf_opts else 1
                 tf = st.selectbox("Zaman Dilimi", tf_opts, index=tf_index)
@@ -354,9 +343,13 @@ def main():
                     st.rerun()
         with c2:
             st.markdown("#### `🟢 AKTİF TREND İŞLEMLERİ`")
-            active = get_data_ref('active_trades').get()
-            if active: 
-                st.dataframe(pd.DataFrame([a.to_dict() for a in active]), use_container_width=True)
+            active_docs = get_data_ref('active_trades').get()
+            
+            # FİLTRE BURAYA EKLENDİ: Sadece 'trend_' ile başlayan dokümanları al
+            trend_trades = [a.to_dict() for a in active_docs if a.id.startswith('trend_')]
+            
+            if trend_trades: 
+                st.dataframe(pd.DataFrame(trend_trades), use_container_width=True)
             else: 
                 st.info("Otopilot sinyal arıyor (ADX & RSI kontrol ediliyor)...")
 
@@ -399,15 +392,15 @@ def main():
             doc = get_data_ref('configs').document('flash').get()
             cfg = doc.to_dict() if doc.exists else {}
             with st.form("f_cfg"):
-                m = st.number_input("İşlem Marjini ($)", 10, 5000, int(cfg.get('margin', 200)))
-                l = st.slider("Kaldıraç (x)", 1, 20, int(cfg.get('leverage', 5)))
+                m_flash = st.number_input("İşlem Marjini ($)", 10, 5000, int(cfg.get('margin', 200)))
+                l_flash = st.slider("Kaldıraç (x)", 1, 20, int(cfg.get('leverage', 5)))
                 tp_pct = st.number_input("Kâr Hedefi (%)", 1.0, 20.0, float(cfg.get('tp_pct', 5.0)))
                 sl_pct = st.number_input("Stop Loss (%)", 1.0, 20.0, float(cfg.get('sl_pct', 3.0)))
                 f_s = st.slider("Hacim Patlama Eşiği (%)", 2.0, 30.0, float(cfg.get('vol_spike', 10.0)))
                 f_a = st.checkbox("Otopilot (Otomatik İşlem)", value=cfg.get('autopilot', False))
                 if st.form_submit_button("Ayarları Kaydet"):
                     get_data_ref('configs').document('flash').set({
-                        **cfg, 'margin': m, 'leverage': l, 'tp_pct': tp_pct, 'sl_pct': sl_pct,
+                        **cfg, 'margin': m_flash, 'leverage': l_flash, 'tp_pct': tp_pct, 'sl_pct': sl_pct,
                         'vol_spike': f_s, 'autopilot': f_a
                     })
                     st.rerun()
