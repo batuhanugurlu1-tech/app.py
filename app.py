@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import requests
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -8,11 +7,12 @@ import json
 import os
 import time
 from datetime import datetime
+import threading
 
 # ==========================================
 # SAYFA AYARLARI
 # ==========================================
-st.set_page_config(page_title="CLOUD SENTINEL V8.1", layout="wide")
+st.set_page_config(page_title="CLOUD SENTINEL V8.2", layout="wide")
 
 st.markdown("""
     <style>
@@ -28,19 +28,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. BULUT BAĞLANTISI (FIREBASE)
+# 1. BULUT BAĞLANTISI
 # ==========================================
 def init_firebase():
     if not firebase_admin._apps:
         try:
             fb_config_str = os.environ.get('FIREBASE_CONFIG', '').strip()
-            if not fb_config_str:
-                return None, "⚠️ BAĞLANTI YOK: Railway panelinde 'FIREBASE_CONFIG' bulunamadı."
-            
+            if not fb_config_str: return None, "⚠️ BAĞLANTI YOK"
             fb_config = json.loads(fb_config_str)
-            if 'apiKey' in fb_config and 'private_key' not in fb_config:
-                return None, "❌ YANLIŞ ANAHTAR: Python için 'Service Account' JSON dosyası gereklidir."
-                
             cred = credentials.Certificate(fb_config)
             firebase_admin.initialize_app(cred)
             return firestore.client(), "BAĞLI"
@@ -52,168 +47,218 @@ db, status_msg = init_firebase()
 app_id = os.environ.get('APP_ID', 'quant-lab-v8')
 
 # ==========================================
-# 2. TEKNİK ANALİZ MOTORU
+# 2. BULUT KONFİGÜRASYONU YÖNETİMİ
 # ==========================================
-def calculate_ema(data, period):
-    return data.ewm(span=period, adjust=False).mean()
+default_config = {
+    'margin': 200, 'leverage': 3, 'timeframe': '1h',
+    'coins': ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+    'ema_f': 21, 'ema_s': 55, 'tp_atr': 3.5, 'autopilot': False
+}
 
-def get_binance_data(symbol, interval='1h', limit=150):
-    try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        res = requests.get(url, timeout=10).json()
-        df = pd.DataFrame(res, columns=['Time', 'Open', 'High', 'Low', 'Close', 'Vol', 'CloseTime', 'QuoteVol', 'Trades', 'TakerBuyBase', 'TakerBuyQuote', 'Ignore'])
-        df['Close'] = df['Close'].astype(float)
-        df['High'] = df['High'].astype(float)
-        df['Low'] = df['Low'].astype(float)
-        return df
-    except Exception:
-        return None
-
-# ==========================================
-# 3. BULUT İŞLEMLERİ (CRUD)
-# ==========================================
-def get_active_pos(symbol):
-    if not db: return None
-    doc = db.collection('artifacts').document(app_id).collection('public').document('active_trades').collection('positions').document(symbol).get()
-    return doc.to_dict() if doc.exists else None
-
-def get_all_active_positions():
-    if not db: return []
-    docs = db.collection('artifacts').document(app_id).collection('public').document('active_trades').collection('positions').get()
-    return [doc.to_dict() for doc in docs]
-
-def save_active_pos(symbol, pos):
-    if not db: return
-    db.collection('artifacts').document(app_id).collection('public').document('active_trades').collection('positions').document(symbol).set(pos)
-
-def close_active_pos(symbol, trade_record):
-    if not db: return
-    db.collection('artifacts').document(app_id).collection('public').document('data').collection('history').add(trade_record)
-    db.collection('artifacts').document(app_id).collection('public').document('active_trades').collection('positions').document(symbol).delete()
+def get_cloud_config():
+    if not db: return default_config
+    doc = db.collection('artifacts').document(app_id).collection('public').document('config').get()
+    if doc.exists:
+        return doc.to_dict()
+    else:
+        db.collection('artifacts').document(app_id).collection('public').document('config').set(default_config)
+        return default_config
 
 # ==========================================
-# 4. ANA PANEL VE OTOPİLOT
+# 3. GERÇEK 7/24 ARKA PLAN MOTORU (DAEMON)
+# ==========================================
+# Sayfa kapansa bile Railway içinde ömür boyu dönen döngü.
+@st.cache_resource
+def start_background_daemon():
+    def run_bot():
+        time.sleep(5) # Veritabanının oturmasını bekle
+        try:
+            db_t = firestore.client()
+        except:
+            return
+
+        while True:
+            try:
+                cfg_doc = db_t.collection('artifacts').document(app_id).collection('public').document('config').get()
+                if not cfg_doc.exists:
+                    time.sleep(30)
+                    continue
+
+                cfg = cfg_doc.to_dict()
+                coins = cfg.get('coins', [])
+                timeframe = cfg.get('timeframe', '1h')
+                f_ema = cfg.get('ema_f', 21)
+                s_ema = cfg.get('ema_s', 55)
+                tp_atr = cfg.get('tp_atr', 3.5)
+                margin = cfg.get('margin', 200)
+                leverage = cfg.get('leverage', 3)
+                autopilot = cfg.get('autopilot', False)
+
+                live_data = []
+
+                for coin in coins:
+                    try:
+                        url = f"https://api.binance.com/api/v3/klines?symbol={coin}&interval={timeframe}&limit=100"
+                        res = requests.get(url, timeout=10).json()
+                        if not isinstance(res, list) or len(res) < 50:
+                            continue
+
+                        closes = pd.Series([float(k[4]) for k in res])
+                        highs = pd.Series([float(k[2]) for k in res])
+                        lows = pd.Series([float(k[3]) for k in res])
+
+                        price = closes.iloc[-1]
+                        ema_f_s = closes.ewm(span=f_ema, adjust=False).mean()
+                        ema_s_s = closes.ewm(span=s_ema, adjust=False).mean()
+
+                        last_f, last_s = ema_f_s.iloc[-1], ema_s_s.iloc[-1]
+                        prev_f, prev_s = ema_f_s.iloc[-2], ema_s_s.iloc[-2]
+
+                        tr = pd.concat([highs - lows, (highs - closes.shift()).abs(), (lows - closes.shift()).abs()], axis=1).max(axis=1)
+                        atr = tr.rolling(14).mean().iloc[-1]
+                        trend = "YUKARI" if last_f > last_s else "AŞAĞI"
+
+                        # Aktif işlemi buluttan kontrol et
+                        pos_ref = db_t.collection('artifacts').document(app_id).collection('public').document('active_trades').collection('positions').document(coin)
+                        pos_doc = pos_ref.get()
+                        active_pos = pos_doc.to_dict() if pos_doc.exists else None
+
+                        # --- KAPANIS KONTROLU ---
+                        if active_pos:
+                            exit_now, result = False, ""
+                            if active_pos['type'] == 'LONG':
+                                if price <= active_pos['sl']: exit_now, result = True, "LOSS"
+                                elif price >= active_pos['tp']: exit_now, result = True, "WIN"
+                            else:
+                                if price >= active_pos['sl']: exit_now, result = True, "LOSS"
+                                elif price <= active_pos['tp']: exit_now, result = True, "WIN"
+
+                            if exit_now and autopilot:
+                                raw_pnl = ((price - active_pos['entry'])/active_pos['entry'])*100 if active_pos['type'] == 'LONG' else ((active_pos['entry'] - price)/active_pos['entry'])*100
+                                lev = active_pos.get('leverage', 1)
+                                mar = active_pos.get('margin', 0)
+                                lev_pnl = raw_pnl * lev
+                                usd_pnl = (mar * lev_pnl) / 100
+
+                                db_t.collection('artifacts').document(app_id).collection('public').document('data').collection('history').add({
+                                    "symbol": coin, "type": active_pos['type'], "pnl_pct": round(lev_pnl, 2), "pnl_usd": round(usd_pnl, 2),
+                                    "margin": mar, "leverage": lev, "result": result, "time": datetime.now().isoformat()
+                                })
+                                pos_ref.delete()
+                                active_pos = None
+
+                        # --- GIRIS KONTROLU ---
+                        elif autopilot:
+                            if prev_f <= prev_s and last_f > last_s:
+                                active_pos = {
+                                    "symbol": coin, "type": "LONG", "entry": price,
+                                    "sl": price - (atr * 2), "tp": price + (atr * tp_atr),
+                                    "margin": margin, "leverage": leverage, "timeframe": timeframe
+                                }
+                                pos_ref.set(active_pos)
+                            elif prev_f >= prev_s and last_f < last_s:
+                                active_pos = {
+                                    "symbol": coin, "type": "SHORT", "entry": price,
+                                    "sl": price + (atr * 2), "tp": price - (atr * tp_atr),
+                                    "margin": margin, "leverage": leverage, "timeframe": timeframe
+                                }
+                                pos_ref.set(active_pos)
+
+                        # Canlı PnL Hesapla (Sadece Radar İçin)
+                        p_pct, p_usd = 0.0, 0.0
+                        if active_pos:
+                            raw_pnl = ((price - active_pos['entry'])/active_pos['entry'])*100 if active_pos['type'] == 'LONG' else ((active_pos['entry'] - price)/active_pos['entry'])*100
+                            p_pct = raw_pnl * active_pos.get('leverage', 1)
+                            p_usd = (active_pos.get('margin', 0) * p_pct) / 100
+
+                        live_data.append({
+                            "Varlık": coin, "Fiyat ($)": round(price, 4), "Trend": trend,
+                            "Durum": f"İŞLEMDE: {active_pos['type']} ({active_pos.get('leverage',1)}x)" if active_pos else "Pusu Modu",
+                            "Anlık PnL (%)": round(p_pct, 2) if active_pos else 0.0,
+                            "Kâr/Zarar ($)": round(p_usd, 2) if active_pos else 0.0
+                        })
+                    except Exception as e:
+                        print(f"Error scanning {coin}: {e}")
+
+                # Buluttaki "Canlı Radar" belgesini güncelle
+                db_t.collection('artifacts').document(app_id).collection('public').document('live_market').set({
+                    'data': live_data, 'updated_at': datetime.now().strftime("%H:%M:%S")
+                })
+
+            except Exception as e:
+                print(f"Daemon Main Error: {e}")
+
+            time.sleep(30) # Motor her 30 saniyede bir tur atar
+
+    t = threading.Thread(target=run_bot, daemon=True)
+    t.start()
+    return t
+
+if db:
+    start_background_daemon()
+
+# ==========================================
+# 4. ARAYÜZ (FRONTEND DASHBOARD)
 # ==========================================
 def main():
-    st.title("🛡️ CLOUD SENTINEL V8.1 // WHALE MODE")
-    st.caption("Muhafazakar Kasa Yönetimi & Saatlik Trend Taraması")
+    st.title("🛡️ CLOUD SENTINEL V8.2 // TRUE DAEMON")
+    st.caption("Arayüzden Bağımsız 7/24 Arka Plan Bulut Motoru")
+    
+    cfg = get_cloud_config()
+    is_autopilot_on = cfg.get('autopilot', False)
     
     if status_msg == "BAĞLI":
-        st.markdown(f'<div class="status-bar online">● BULUT DURUMU: {status_msg} | ÇOKLU TARAMA AKTİF</div>', unsafe_allow_html=True)
+        if is_autopilot_on:
+            st.markdown(f'<div class="status-bar online">● BULUT DURUMU: {status_msg} | 🚀 MOTOR 7/24 ÇALIŞIYOR (SAYFAYI KAPATABİLİRSİNİZ)</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="status-bar" style="background-color:#333; color:white;">● BULUT DURUMU: {status_msg} | ⏸️ MOTOR DURAKLATILDI</div>', unsafe_allow_html=True)
     else:
         st.markdown(f'<div class="status-bar offline">{status_msg}</div>', unsafe_allow_html=True)
         return 
 
     with st.sidebar:
-        st.header("💰 RİSK YÖNETİMİ")
-        # Muhafazakar Ayarlar Varsayılan
-        margin_per_trade = st.number_input("İşlem Başına Marjin ($)", min_value=10, max_value=100000, value=200, step=10, help="Kasanızın %2'sini geçmemelidir.")
-        leverage = st.slider("Kaldıraç (x)", min_value=1, max_value=20, value=3, help="Düşük risk için 2x - 5x arası tavsiye edilir.")
-        
-        st.divider()
-        st.header("⚙️ STRATEJİ AYARLARI")
-        
-        timeframe = st.selectbox("Mum Zaman Dilimi", ["15m", "1h", "4h", "1d"], index=1, help="1h ve 4h sahte sinyalleri filtreler.")
-        
-        coin_list = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "AVAXUSDT"]
-        selected_coins = st.multiselect("Demirbaş Varlıklar", coin_list, default=["BTCUSDT", "ETHUSDT", "SOLUSDT"])
-        
-        # Trend Onayı için Yavaş EMA'lar
-        f_ema_val = st.slider("Hızlı EMA", 5, 50, 21)
-        s_ema_val = st.slider("Yavaş EMA", 10, 200, 55)
-        tp_atr = st.slider("Kâr Hedefi (ATR x)", 1.0, 6.0, 3.5)
-        
-        st.divider()
-        auto_pilot = st.toggle("🔄 Otopilot Döngüsü (Açık Bırak)", value=False)
-        if st.button("Şimdi Tara"):
-            st.rerun()
-
-    if not selected_coins:
-        st.warning("Lütfen yan menüden en az bir varlık seçin.")
-        return
-
-    # --- OTOPİLOT DÖNGÜSÜ (PİYASA TARAMASI) ---
-    live_market_data = []
-    
-    for coin in selected_coins:
-        df = get_binance_data(coin, interval=timeframe)
-        if df is None or df.empty:
-            continue
-
-        price = df['Close'].iloc[-1]
-        df['EMA_F'] = calculate_ema(df['Close'], f_ema_val)
-        df['EMA_S'] = calculate_ema(df['Close'], s_ema_val)
-        df['ATR'] = (df['High'] - df['Low']).rolling(14).mean()
-        
-        last_f, last_s = df['EMA_F'].iloc[-1], df['EMA_S'].iloc[-1]
-        prev_f, prev_s = df['EMA_F'].iloc[-2], df['EMA_S'].iloc[-2]
-        atr = df['ATR'].iloc[-1]
-        trend = "YUKARI" if last_f > last_s else "AŞAĞI"
-
-        active_pos = get_active_pos(coin)
-        
-        # 1. KAPANIS KONTROLU
-        if active_pos:
-            exit_now, res = False, ""
-            if active_pos['type'] == 'LONG':
-                if price <= active_pos['sl']: exit_now, res = True, "LOSS"
-                elif price >= active_pos['tp']: exit_now, res = True, "WIN"
-            else:
-                if price >= active_pos['sl']: exit_now, res = True, "LOSS"
-                elif price <= active_pos['tp']: exit_now, res = True, "WIN"
-                
-            if exit_now:
-                raw_pnl = ((price - active_pos['entry'])/active_pos['entry'])*100 if active_pos['type'] == 'LONG' else ((active_pos['entry'] - price)/active_pos['entry'])*100
-                pos_lev = active_pos.get('leverage', 1)
-                pos_margin = active_pos.get('margin', 0)
-                
-                lev_pnl_pct = raw_pnl * pos_lev
-                pnl_usd = (pos_margin * lev_pnl_pct) / 100
-                
-                close_active_pos(coin, {
-                    "symbol": coin, "type": active_pos['type'], "pnl_pct": round(lev_pnl_pct, 2), "pnl_usd": round(pnl_usd, 2),
-                    "margin": pos_margin, "leverage": pos_lev,
-                    "result": res, "time": datetime.now().isoformat()
-                })
-                active_pos = None 
-        
-        # 2. GIRIS KONTROLU
-        else:
-            if prev_f <= prev_s and last_f > last_s:
-                new_pos = {
-                    "symbol": coin, "type": "LONG", "entry": price, 
-                    "sl": price - (atr * 2), "tp": price + (atr * tp_atr),
-                    "margin": margin_per_trade, "leverage": leverage, "timeframe": timeframe
+        with st.form("config_form"):
+            st.header("☁️ BULUT AYARLARI")
+            st.info("Değişikliklerin bot motoruna geçmesi için 'Buluta Kaydet' tuşuna basın.")
+            
+            new_margin = st.number_input("İşlem Başına Marjin ($)", min_value=10, max_value=100000, value=int(cfg.get('margin', 200)))
+            new_leverage = st.slider("Kaldıraç (x)", 1, 20, int(cfg.get('leverage', 3)))
+            
+            tf_options = ["15m", "1h", "4h", "1d"]
+            curr_tf = cfg.get('timeframe', '1h')
+            new_tf = st.selectbox("Mum Zaman Dilimi", tf_options, index=tf_options.index(curr_tf) if curr_tf in tf_options else 1)
+            
+            coin_list = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "AVAXUSDT"]
+            curr_coins = cfg.get('coins', ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+            new_coins = st.multiselect("Varlıklar", coin_list, default=[c for c in curr_coins if c in coin_list])
+            
+            new_f_ema = st.slider("Hızlı EMA", 5, 50, int(cfg.get('ema_f', 21)))
+            new_s_ema = st.slider("Yavaş EMA", 10, 200, int(cfg.get('ema_s', 55)))
+            new_tp = st.slider("Kâr Hedefi (ATR x)", 1.0, 6.0, float(cfg.get('tp_atr', 3.5)))
+            
+            st.divider()
+            new_autopilot = st.toggle("🤖 7/24 Arka Plan Motoru", value=is_autopilot_on)
+            
+            submitted = st.form_submit_button("☁️ Ayarları Buluta Kaydet")
+            if submitted:
+                new_cfg = {
+                    'margin': new_margin, 'leverage': new_leverage, 'timeframe': new_tf,
+                    'coins': new_coins, 'ema_f': new_f_ema, 'ema_s': new_s_ema,
+                    'tp_atr': new_tp, 'autopilot': new_autopilot
                 }
-                save_active_pos(coin, new_pos)
-                active_pos = new_pos
-            elif prev_f >= prev_s and last_f < last_s:
-                new_pos = {
-                    "symbol": coin, "type": "SHORT", "entry": price, 
-                    "sl": price + (atr * 2), "tp": price - (atr * tp_atr),
-                    "margin": margin_per_trade, "leverage": leverage, "timeframe": timeframe
-                }
-                save_active_pos(coin, new_pos)
-                active_pos = new_pos
+                db.collection('artifacts').document(app_id).collection('public').document('config').set(new_cfg)
+                st.success("Ayarlar Buluta İletildi!")
+                time.sleep(1)
+                st.rerun()
 
-        # Canlı Veri Hazırlığı
-        pnl_now_pct, pnl_now_usd = 0.0, 0.0
-        if active_pos:
-            raw_pnl = ((price - active_pos['entry'])/active_pos['entry'])*100 if active_pos['type'] == 'LONG' else ((active_pos['entry'] - price)/active_pos['entry'])*100
-            pnl_now_pct = raw_pnl * active_pos.get('leverage', 1)
-            pnl_now_usd = (active_pos.get('margin', 0) * pnl_now_pct) / 100
-
-        live_market_data.append({
-            "Varlık": coin,
-            "Fiyat ($)": round(price, 4),
-            "Trend": trend,
-            "Durum": f"İŞLEMDE: {active_pos['type']} ({active_pos.get('leverage',1)}x)" if active_pos else "Pusu Modu",
-            "Anlık PnL (%)": round(pnl_now_pct, 2) if active_pos else 0.0,
-            "Kâr/Zarar ($)": round(pnl_now_usd, 2) if active_pos else 0.0
-        })
+        st.divider()
+        ui_refresh = st.toggle("👁️ Ekranda Canlı İzle (10sn Yenileme)", value=False, help="Açıkken bu web sayfası buluttan yeni verileri çekmek için sürekli yenilenir.")
 
     # --- EKRAN ÇIKTILARI ---
-    all_active = get_all_active_positions()
+    # Aktif Pozisyonları Buluttan Çek
+    active_docs = db.collection('artifacts').document(app_id).collection('public').document('active_trades').collection('positions').get()
+    all_active = [doc.to_dict() for doc in active_docs]
+    
     if all_active:
         st.markdown("#### `🟢 AKTİF POZİSYONLAR`")
         cols = st.columns(min(len(all_active), 4)) 
@@ -225,28 +270,33 @@ def main():
                     <h4 style="margin:0;">{pos['symbol']} <span style="font-size:0.6em; color:gray;">{pos['type']}</span></h4>
                     <p style="margin:0; font-size:12px; color:gray;">Marjin: ${pos.get('margin',0)} | {pos.get('leverage',1)}x | TF: {pos.get('timeframe', '1h')}</p>
                     <p style="margin:0; font-size:14px; margin-top:5px;">Giriş: {pos['entry']}</p>
-                    <p style="margin:0; font-size:14px; color:#00FF41;">Hedef (TP): {pos['tp']:.4f}</p>
-                    <p style="margin:0; font-size:14px; color:#FF003C;">Stop (SL): {pos['sl']:.4f}</p>
+                    <p style="margin:0; font-size:14px; color:#00FF41;">Hedef: {pos['tp']:.4f}</p>
+                    <p style="margin:0; font-size:14px; color:#FF003C;">Stop: {pos['sl']:.4f}</p>
                 </div>
                 """, unsafe_allow_html=True)
     
     st.divider()
-    st.markdown("#### `📡 CANLI RADAR ÖZETİ`")
-    df_live = pd.DataFrame(live_market_data)
     
-    def highlight_pnl(val):
-        color = '#00FF41' if val > 0 else '#FF003C' if val < 0 else 'gray'
-        return f'color: {color}; font-weight: bold;'
-    
-    # Pandas Sürüm Uyumluluğu (Güvenli Boyama ve Streamlit deprecated parametre düzeltmesi)
-    try:
-        st.dataframe(df_live.style.map(highlight_pnl, subset=['Anlık PnL (%)', 'Kâr/Zarar ($)']), width='stretch')
-    except Exception:
-        try:
-            st.dataframe(df_live.style.applymap(highlight_pnl, subset=['Anlık PnL (%)', 'Kâr/Zarar ($)']), width='stretch')
-        except:
-            st.dataframe(df_live, width='stretch')
-    
+    # Canlı Radar Verilerini Buluttan Çek (Motor Oraya Yazıyor)
+    live_doc = db.collection('artifacts').document(app_id).collection('public').document('live_market').get()
+    if live_doc.exists:
+        live_data = live_doc.to_dict()
+        st.markdown(f"#### `📡 CANLI RADAR ÖZETİ` <span style='font-size:12px; color:gray;'>Son Güncelleme: {live_data.get('updated_at', '...')}</span>", unsafe_allow_html=True)
+        df_live = pd.DataFrame(live_data.get('data', []))
+        if not df_live.empty:
+            def highlight_pnl(val):
+                color = '#00FF41' if val > 0 else '#FF003C' if val < 0 else 'gray'
+                return f'color: {color}; font-weight: bold;'
+            try:
+                st.dataframe(df_live.style.map(highlight_pnl, subset=['Anlık PnL (%)', 'Kâr/Zarar ($)']), width='stretch')
+            except Exception:
+                try:
+                    st.dataframe(df_live.style.applymap(highlight_pnl, subset=['Anlık PnL (%)', 'Kâr/Zarar ($)']), width='stretch')
+                except:
+                    st.dataframe(df_live, width='stretch')
+    else:
+        st.info("Motor henüz piyasa taramasını tamamlamadı. Lütfen biraz bekleyin.")
+
     # Geçmiş Çekimi ve İstatistikler
     hist_docs = db.collection('artifacts').document(app_id).collection('public').document('data').collection('history').get()
     history = [d.to_dict() for d in hist_docs]
@@ -254,7 +304,7 @@ def main():
     if history:
         st.divider()
         total_trades = len(history)
-        wins = len([h for h in history if h.get('result') == 'WIN'])
+        wins = len([h for h in history if h.get('result') == 'WIN'] + [h for h in history if 'WIN' in h.get('result', '')])
         win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
         total_pnl_usd = sum([h.get('pnl_usd', 0) for h in history])
         
@@ -273,8 +323,9 @@ def main():
         else:
             st.table(df_hist.sort_values('time', ascending=False).head(10))
 
-    if auto_pilot:
-        time.sleep(30)
+    # YALNIZCA GÖRSELLİĞİ CANLI TUTMAK İÇİN
+    if ui_refresh:
+        time.sleep(10)
         st.rerun()
 
 if __name__ == "__main__":
