@@ -26,7 +26,11 @@ if not firebase_admin._apps:
         st.error(f"Bağlantı Hatası: {e}")
 
 # Veritabanı ve Uygulama Kimliği
-db = firestore.client()
+try:
+    db = firestore.client()
+except:
+    db = None
+    
 app_id = os.environ.get('APP_ID', 'quant-lab-v7')
 
 # ==========================================
@@ -48,16 +52,16 @@ def get_binance_data(symbol, interval='15m', limit=100):
 # ADIM 3: BULUT İŞLEMLERİ (KAYIT VE OKUMA)
 # ==========================================
 def get_active_pos():
-    # Aktif işlemi buluttan oku
+    if not db: return None
     doc = db.collection('artifacts').document(app_id).collection('public').document('active_trade').get()
     return doc.to_dict() if doc.exists else None
 
 def save_active_pos(pos):
-    # Yeni işlemi buluta yaz
+    if not db: return
     db.collection('artifacts').document(app_id).collection('public').document('active_trade').set(pos)
 
 def close_active_pos(trade_record):
-    # İşlemi kapat ve geçmişe kaydet
+    if not db: return
     db.collection('artifacts').document(app_id).collection('public').document('data').collection('history').add(trade_record)
     db.collection('artifacts').document(app_id).collection('public').document('active_trade').delete()
 
@@ -86,6 +90,10 @@ def main():
         
         if st.button("🔄 SİSTEMİ YENİLE"):
             st.rerun()
+
+    if not db:
+        st.warning("Veritabanı bağlantısı bekleniyor... Lütfen Railway Variables kısmına FIREBASE_CONFIG eklediğinizden emin olun.")
+        return
 
     # --- BOT MANTIĞI ÇALIŞIYOR ---
     try:
