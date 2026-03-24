@@ -238,14 +238,14 @@ def main():
         color = '#00FF41' if val > 0 else '#FF003C' if val < 0 else 'gray'
         return f'color: {color}; font-weight: bold;'
     
-    # Pandas Sürüm Uyumluluğu (Güvenli Boyama)
+    # Pandas Sürüm Uyumluluğu (Güvenli Boyama ve Streamlit deprecated parametre düzeltmesi)
     try:
-        st.dataframe(df_live.style.map(highlight_pnl, subset=['Anlık PnL (%)', 'Kâr/Zarar ($)']), use_container_width=True)
+        st.dataframe(df_live.style.map(highlight_pnl, subset=['Anlık PnL (%)', 'Kâr/Zarar ($)']), width='stretch')
     except Exception:
         try:
-            st.dataframe(df_live.style.applymap(highlight_pnl, subset=['Anlık PnL (%)', 'Kâr/Zarar ($)']), use_container_width=True)
+            st.dataframe(df_live.style.applymap(highlight_pnl, subset=['Anlık PnL (%)', 'Kâr/Zarar ($)']), width='stretch')
         except:
-            st.dataframe(df_live, use_container_width=True)
+            st.dataframe(df_live, width='stretch')
     
     # Geçmiş Çekimi ve İstatistikler
     hist_docs = db.collection('artifacts').document(app_id).collection('public').document('data').collection('history').get()
