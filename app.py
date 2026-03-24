@@ -330,7 +330,9 @@ def main():
                 new_tp = st.slider("Kâr Hedefi (ATR x)", 1.0, 6.0, float(cfg.get('tp_atr', 3.5)))
                 
                 st.divider()
-                new_autopilot = st.toggle("🤖 Trend Motoru Aç/Kapat", value=is_autopilot_on)
+                st.markdown("### 🤖 Motor Kontrolü")
+                new_auto_str = st.radio("Trend Motoru:", ["AÇIK", "KAPALI"], index=0 if is_autopilot_on else 1, horizontal=True)
+                new_autopilot = True if new_auto_str == "AÇIK" else False
                 
                 if st.form_submit_button("☁️ Trendi Kaydet ve Başlat"):
                     db.collection('artifacts').document(app_id).collection('public').document('config').set({
@@ -408,7 +410,9 @@ def main():
                 st.divider()
                 st.caption(f"⚠️ Toplam Grid Kapasitesi (Risk): ${new_g_margin * new_g_max}")
                 
-                new_g_autopilot = st.toggle("🤖 Grid Motoru Aç/Kapat", value=is_grid_on)
+                st.markdown("### 🤖 Motor Kontrolü")
+                new_g_auto_str = st.radio("Karınca (Grid) Motoru:", ["AÇIK", "KAPALI"], index=0 if is_grid_on else 1, horizontal=True)
+                new_g_autopilot = True if new_g_auto_str == "AÇIK" else False
                 
                 if st.form_submit_button("☁️ Grid'i Kaydet ve Başlat"):
                     db.collection('artifacts').document(app_id).collection('public').document('config_grid').set({
