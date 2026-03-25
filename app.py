@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # 🎨 UI & TEMA AYARLARI
 # ==========================================
-st.set_page_config(page_title="QUANT OMNI V9.13 PRO", layout="wide")
+st.set_page_config(page_title="QUANT OMNI V9.14 PRO", layout="wide")
 
 st.markdown("""
     <style>
@@ -44,27 +44,22 @@ st.markdown("""
 VALID_SYMBOL_PATTERN = re.compile(r'^[A-Z0-9]{2,20}$')
 VALID_INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
 
-# UI'da sunulan sabit seçenekler
 AVAILABLE_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 AVAILABLE_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 GRID_COINS = ["BTCUSDT", "ETHUSDT"]
 
-# History sorgu limiti — Firestore okuma kotasını korur
 HISTORY_QUERY_LIMIT = 500
 
 
 def is_valid_symbol(symbol: str) -> bool:
-    """Binance sembol adını doğrular — injection koruması."""
     return isinstance(symbol, str) and bool(VALID_SYMBOL_PATTERN.match(symbol))
 
 
 def is_valid_interval(interval: str) -> bool:
-    """Binance interval parametresini doğrular — URL injection koruması."""
     return isinstance(interval, str) and interval in VALID_INTERVALS
 
 
 def safe_float(val, default: float = 0.0) -> float:
-    """Herhangi bir değeri güvenli float'a çevirir. Firestore bazen string döndürür."""
     try:
         return float(val)
     except (TypeError, ValueError):
@@ -72,31 +67,45 @@ def safe_float(val, default: float = 0.0) -> float:
 
 
 def safe_int(val, default: int = 0) -> int:
-    """Herhangi bir değeri güvenli int'e çevirir."""
     try:
         return int(val)
     except (TypeError, ValueError):
         return default
 
+
+def clamp_int(val, lo: int, hi: int, default: int) -> int:
+    """Firestore'dan gelen değeri güvenli int'e çevirip widget range'ine sıkıştırır."""
+    return max(lo, min(hi, safe_int(val, default)))
+
+
+def clamp_float(val, lo: float, hi: float, default: float) -> float:
+    """Firestore'dan gelen değeri güvenli float'a çevirip widget range'ine sıkıştırır."""
+    return max(lo, min(hi, safe_float(val, default)))
+
+
 # ==========================================
-# 🌐 HTTP SESSION (Connection Pooling)
+# 🌐 HTTP SESSION — Thread-Safe
 # ==========================================
-@st.cache_resource
-def get_http_session():
-    """Tek bir requests.Session döndürür — TCP connection reuse sağlar.
-    3 motorda her biri 20-45 sn'de istek atıyor, session ile
-    TCP handshake tekrarı önlenir."""
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=2,
-        backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=5, pool_maxsize=10)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
+_thread_local = threading.local()
+
+
+def get_http_session() -> requests.Session:
+    """Her thread için ayrı requests.Session döndürür.
+    requests.Session thread-safe DEĞİLDİR — paylaşılamaz.
+    threading.local() ile her thread kendi session'ını alır."""
+    if not hasattr(_thread_local, 'session'):
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=5, pool_maxsize=10)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _thread_local.session = session
+    return _thread_local.session
 
 
 # ==========================================
@@ -130,18 +139,15 @@ app_id = os.environ.get('APP_ID', 'quant-lab-v9-pro')
 
 
 def get_data_ref(collection_name):
-    """Firebase collection referansı döndürür. db None ise hata fırlatır."""
     if db is None:
         raise RuntimeError("Firebase bağlantısı yok. get_data_ref çağrılamaz.")
     return db.collection('artifacts').document(app_id).collection('public').document('data').collection(collection_name)
 
 
 # ==========================================
-# 🛠️ YARDIMCI FONKSİYONLAR (TIP GÜVENLİĞİ)
+# 🛠️ YARDIMCI FONKSİYONLAR
 # ==========================================
 def safe_str_time(val) -> str:
-    """Herhangi bir zaman değerini güvenli string'e çevirir.
-    Firestore Timestamp, datetime, veya ISO string olabilir."""
     if isinstance(val, str):
         return val
     if hasattr(val, 'isoformat'):
@@ -150,7 +156,6 @@ def safe_str_time(val) -> str:
 
 
 def safe_short_time(val) -> str:
-    """Zaman değerinden sadece saat kısmını çıkarır."""
     s = safe_str_time(val)
     if 'T' in s:
         return s.split('T')[1][:8]
@@ -160,14 +165,11 @@ def safe_short_time(val) -> str:
 
 
 def safe_display_time(val) -> str:
-    """Zaman değerini 'YYYY-MM-DD HH:MM' formatına çevirir."""
     s = safe_str_time(val)
     return s.replace('T', ' ')[:16]
 
 
 def filter_valid_defaults(defaults, options):
-    """st.multiselect default listesinden options'ta olmayanları temizler.
-    Firestore'da options dışı coin varsa Streamlit crash'ini önler."""
     if not isinstance(defaults, list):
         return [options[0]] if options else []
     filtered = [d for d in defaults if d in options]
@@ -175,8 +177,6 @@ def filter_valid_defaults(defaults, options):
 
 
 def safe_selectbox_index(value, options, fallback_index=0):
-    """st.selectbox için güvenli index döndürür.
-    Firestore'daki değer options'ta yoksa fallback kullanır."""
     try:
         return options.index(value)
     except ValueError:
@@ -195,14 +195,12 @@ def calculate_advanced_indicators(df, fast_ema, slow_ema):
     df['EMA_F'] = df['C'].ewm(span=fast_ema, adjust=False).mean()
     df['EMA_S'] = df['C'].ewm(span=slow_ema, adjust=False).mean()
 
-    # RSI — sıfıra bölünme koruması
     delta = df['C'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1 / 14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1 / 14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     df['RSI'] = (100 - (100 / (1 + rs))).fillna(100.0)
 
-    # ATR
     tr = pd.concat([
         df['H'] - df['L'],
         np.abs(df['H'] - df['C'].shift()),
@@ -210,7 +208,6 @@ def calculate_advanced_indicators(df, fast_ema, slow_ema):
     ], axis=1).max(axis=1)
     df['ATR'] = tr.ewm(alpha=1 / 14, adjust=False).mean()
 
-    # ADX — sıfıra bölünme koruması
     up_move = df['H'] - df['H'].shift(1)
     down_move = df['L'].shift(1) - df['L']
     plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
@@ -289,11 +286,15 @@ def whale_engine():
                     leverage = safe_float(configs.get('leverage', 3), 3.0)
                     tp_atr = safe_float(configs.get('tp_atr', 3.5), 3.5)
 
-                    # Negatif/sıfır parametre koruması
                     if ema_f_period <= 0 or ema_s_period <= 0 or margin <= 0 or leverage <= 0:
                         logger.warning("Whale: Geçersiz config parametreleri, atlanıyor.")
                         time.sleep(45)
                         continue
+
+                    # EMA mantık koruması — fast >= slow ise swap et
+                    if ema_f_period >= ema_s_period:
+                        logger.warning(f"Whale: EMA fast({ema_f_period}) >= slow({ema_s_period}), swap yapılıyor.")
+                        ema_f_period, ema_s_period = ema_s_period, ema_f_period
 
                     for symbol in coins:
                         if not is_valid_symbol(symbol):
@@ -304,7 +305,6 @@ def whale_engine():
 
                         df = calculate_advanced_indicators(raw_df, ema_f_period, ema_s_period)
 
-                        # İndikatör hesaplaması sonrası yeterli veri kontrolü
                         if len(df) < 2:
                             continue
 
@@ -313,7 +313,6 @@ def whale_engine():
                         if price <= 0:
                             continue
 
-                        # NaN indikatör kontrolü — warmup dönemi
                         if pd.isna(current['EMA_F']) or pd.isna(current['EMA_S']) or pd.isna(current['RSI']) or pd.isna(current['ADX']) or pd.isna(current['ATR']):
                             continue
 
@@ -554,8 +553,6 @@ def falcon_engine():
                                     time.sleep(30)
                                     continue
 
-                                # Her ticker'ı ayrı ayrı parse et —
-                                # tek bozuk ticker tüm listeyi öldürmesin
                                 spikes = []
                                 for t in ticks:
                                     try:
@@ -603,10 +600,9 @@ def falcon_engine():
 
 
 # ==========================================
-# 🖥️ MERKEZİ KONTROL ARAYÜZÜ (ŞEFFAF MOD)
+# 🖥️ MERKEZİ KONTROL ARAYÜZÜ
 # ==========================================
 def calculate_bot_stats(history_data, bot_name):
-    """Bot bazında istatistik hesaplar. Tip güvenliği dahil."""
     bot_data = [h for h in history_data if h.get('bot') == bot_name]
     if not bot_data:
         return 0, 0.0, 0.0
@@ -629,8 +625,6 @@ def calculate_bot_stats(history_data, bot_name):
 
 
 def safe_render_dataframe(data_list, rename_map, desired_order=None):
-    """DataFrame oluşturur, güvenli rename yapar, sadece mevcut sütunları gösterir.
-    Tekrarlanan UI kalıbını DRY hale getirir."""
     if not data_list:
         return None
     df = pd.DataFrame(data_list)
@@ -644,7 +638,7 @@ def safe_render_dataframe(data_list, rename_map, desired_order=None):
 
 
 def main():
-    st.title("🛡️ QUANT OMNI SENTINEL V9.13 PRO")
+    st.title("🛡️ QUANT OMNI SENTINEL V9.14 PRO")
 
     if db:
         st.markdown(
@@ -655,9 +649,10 @@ def main():
         ant_engine()
         falcon_engine()
 
-        # History sorgusuna limit koy — Firestore okuma kotasını korur
-        hist_query = get_data_ref('history').order_by('time', direction=firestore.Query.DESCENDING).limit(HISTORY_QUERY_LIMIT)
-        hist_docs = hist_query.get()
+        # History — limit ile Firestore kotası korunuyor
+        # order_by olmadan çekip Python'da sıralıyoruz —
+        # böylece 'time' field'ı olmayan eski dokümanlar da kaybolmaz
+        hist_docs = get_data_ref('history').limit(HISTORY_QUERY_LIMIT).get()
         all_history = [h.to_dict() for h in hist_docs] if hist_docs else []
     else:
         st.markdown(
@@ -684,10 +679,9 @@ def main():
             doc = get_data_ref('configs').document('trend').get()
             cfg = doc.to_dict() if doc.exists else {}
             with st.form("t_cfg"):
-                m = st.number_input("İşlem Marjini ($)", 10, 5000, safe_int(cfg.get('margin', 300), 300))
-                l = st.slider("Kaldıraç (x)", 1, 20, safe_int(cfg.get('leverage', 3), 3))
+                m = st.number_input("İşlem Marjini ($)", 10, 5000, clamp_int(cfg.get('margin', 300), 10, 5000, 300))
+                l = st.slider("Kaldıraç (x)", 1, 20, clamp_int(cfg.get('leverage', 3), 1, 20, 3))
 
-                # Multiselect default güvenliği — options dışı coin crash'i önler
                 saved_coins = cfg.get('coins', ["BTCUSDT"])
                 coins = st.multiselect(
                     "Varlıklar",
@@ -700,13 +694,16 @@ def main():
                     "Zaman Dilimi", AVAILABLE_TIMEFRAMES,
                     index=safe_selectbox_index(current_tf, AVAILABLE_TIMEFRAMES, 1)
                 )
-                ema_f = st.slider("Hızlı EMA", 5, 50, safe_int(cfg.get('ema_f', 9), 9))
-                ema_s = st.slider("Yavaş EMA", 10, 200, safe_int(cfg.get('ema_s', 21), 21))
-                adx_t = st.slider("ADX Filtresi (Gürültü Önleyici)", 0, 40, safe_int(cfg.get('adx_t', 15), 15))
-                tp_atr = st.slider("Kâr Hedefi (ATR x)", 1.0, 6.0, float(min(max(safe_float(cfg.get('tp_atr', 3.5), 3.5), 1.0), 6.0)))
+                ema_f = st.slider("Hızlı EMA", 5, 50, clamp_int(cfg.get('ema_f', 9), 5, 50, 9))
+                ema_s = st.slider("Yavaş EMA", 10, 200, clamp_int(cfg.get('ema_s', 21), 10, 200, 21))
+                adx_t = st.slider("ADX Filtresi (Gürültü Önleyici)", 0, 40, clamp_int(cfg.get('adx_t', 15), 0, 40, 15))
+                tp_atr = st.slider("Kâr Hedefi (ATR x)", 1.0, 6.0, clamp_float(cfg.get('tp_atr', 3.5), 1.0, 6.0, 3.5))
 
                 auto = st.checkbox("Otopilot Aktif", value=cfg.get('autopilot', False))
                 if st.form_submit_button("Ayarları Kaydet"):
+                    # EMA validasyonu — fast >= slow ise uyar ama kaydet
+                    if ema_f >= ema_s:
+                        st.warning(f"⚠️ Hızlı EMA ({ema_f}) ≥ Yavaş EMA ({ema_s}). Motor otomatik swap yapacak.")
                     get_data_ref('configs').document('trend').set({
                         'margin': m, 'leverage': l, 'coins': coins,
                         'timeframe': tf, 'ema_f': ema_f, 'ema_s': ema_s,
@@ -754,15 +751,15 @@ def main():
                 )
                 space = st.number_input(
                     "Ağ Aralığı (%)", 0.1, 5.0,
-                    float(min(max(safe_float(cfg_grid.get('grid_spacing_pct', 0.5), 0.5), 0.1), 5.0))
+                    clamp_float(cfg_grid.get('grid_spacing_pct', 0.5), 0.1, 5.0, 0.5)
                 )
                 m_grid = st.number_input(
                     "Parça Başı Bütçe ($)", 10, 500,
-                    safe_int(cfg_grid.get('margin_per_grid', 100), 100)
+                    clamp_int(cfg_grid.get('margin_per_grid', 100), 10, 500, 100)
                 )
                 max_g = st.number_input(
                     "Maksimum Ağ Sayısı", 10, 100,
-                    safe_int(cfg_grid.get('max_grids', 50), 50)
+                    clamp_int(cfg_grid.get('max_grids', 50), 10, 100, 50)
                 )
                 auto_g = st.checkbox("Otopilot Aktif", value=cfg_grid.get('autopilot', False))
                 if st.form_submit_button("Ayarları Kaydet"):
@@ -827,11 +824,11 @@ def main():
             doc = get_data_ref('configs').document('flash').get()
             cfg_flash = doc.to_dict() if doc.exists else {}
             with st.form("f_cfg"):
-                m_flash = st.number_input("İşlem Marjini ($)", 10, 5000, safe_int(cfg_flash.get('margin', 200), 200))
-                l_flash = st.slider("Kaldıraç (x)", 1, 20, safe_int(cfg_flash.get('leverage', 5), 5))
-                tp_pct_input = st.number_input("Kâr Hedefi (%)", 1.0, 20.0, float(min(max(safe_float(cfg_flash.get('tp_pct', 5.0), 5.0), 1.0), 20.0)))
-                sl_pct_input = st.number_input("Zarar Kes (%)", 1.0, 20.0, float(min(max(safe_float(cfg_flash.get('sl_pct', 3.0), 3.0), 1.0), 20.0)))
-                f_s = st.slider("Hacim Patlama Eşiği (%)", 2.0, 50.0, float(min(max(safe_float(cfg_flash.get('vol_spike', 10.0), 10.0), 2.0), 50.0)))
+                m_flash = st.number_input("İşlem Marjini ($)", 10, 5000, clamp_int(cfg_flash.get('margin', 200), 10, 5000, 200))
+                l_flash = st.slider("Kaldıraç (x)", 1, 20, clamp_int(cfg_flash.get('leverage', 5), 1, 20, 5))
+                tp_pct_input = st.number_input("Kâr Hedefi (%)", 1.0, 20.0, clamp_float(cfg_flash.get('tp_pct', 5.0), 1.0, 20.0, 5.0))
+                sl_pct_input = st.number_input("Zarar Kes (%)", 1.0, 20.0, clamp_float(cfg_flash.get('sl_pct', 3.0), 1.0, 20.0, 3.0))
+                f_s = st.slider("Hacim Patlama Eşiği (%)", 2.0, 50.0, clamp_float(cfg_flash.get('vol_spike', 10.0), 2.0, 50.0, 10.0))
                 f_a = st.checkbox("Otopilot Aktif", value=cfg_flash.get('autopilot', False))
                 if st.form_submit_button("Ayarları Kaydet"):
                     get_data_ref('configs').document('flash').set({
