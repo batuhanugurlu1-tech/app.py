@@ -210,6 +210,8 @@ def whale_engine():
                     leverage = float(configs.get('leverage', 3))
                     tp_atr = float(configs.get('tp_atr', 3.5))
 
+                    current_status = {}
+
                     for symbol in coins:
                         if not is_valid_symbol(symbol):
                             continue
@@ -222,6 +224,15 @@ def whale_engine():
                         price = float(current['C'])
                         if price <= 0:
                             continue
+                        
+                        # RADAR İÇİN DURUM KAYDI (Arayüze Yansıtılacak)
+                        current_status[symbol] = {
+                            'price': round(price, 4),
+                            'ema_f': round(float(current['EMA_F']), 4),
+                            'ema_s': round(float(current['EMA_S']), 4),
+                            'rsi': round(float(current['RSI']), 2),
+                            'adx': round(float(current['ADX']), 2)
+                        }
 
                         pos_ref = get_data_ref('active_trades').document(f"trend_{symbol}")
                         pos_doc = pos_ref.get()
@@ -283,6 +294,17 @@ def whale_engine():
                                     'margin': margin, 'leverage': leverage,
                                     'symbol': symbol, 'time': datetime.now().isoformat()
                                 })
+                    
+                    # Radar durumunu buluta kaydet (Arayüz okuyabilsin diye)
+                    try:
+                        if current_status:
+                            get_data_ref('states').document('trend_status').set({
+                                'data': current_status,
+                                'updated': datetime.now().isoformat()
+                            })
+                    except Exception as e:
+                        logger.error(f"Trend radar update error: {e}")
+
                 time.sleep(45)
             except Exception as e:
                 logger.error(f"Whale Error: {e}")
@@ -590,6 +612,29 @@ def main():
                 st.markdown("""<div class='action-box'><b>⚡ Ne Olacak?</b> Fiyat 'Kâr Al' seviyesine gelirse işlem kazançla kapatılacak. 'Zarar Kes' seviyesine düşerse zararla kapatılıp fon korunacak.</div>""", unsafe_allow_html=True)
             else:
                 st.info("Şu an açık Trend işlemi yok. Sistem yeni EMA kesişimi ve yeterli ADX gücü bekliyor.")
+
+            # YENİ EKLENEN RADAR SİSTEMİ
+            st.markdown("#### `📡 CANLI SİNYAL RADARI`")
+            status_doc = get_data_ref('states').document('trend_status').get()
+            if status_doc.exists:
+                status_data = status_doc.to_dict().get('data', {})
+                if status_data:
+                    radar_list = []
+                    adx_thresh = float(cfg.get('adx_t', 15))
+                    for sym, vals in status_data.items():
+                        ema_cross = "🟢 Yükseliş" if vals['ema_f'] > vals['ema_s'] else "🔴 Düşüş"
+                        adx_ok = "✅ Yeterli" if vals['adx'] >= adx_thresh else "⏳ Zayıf (Bekliyor)"
+                        radar_list.append({
+                            'Varlık': sym,
+                            'Trend Yönü': ema_cross,
+                            'Güç (ADX)': f"{vals['adx']} ({adx_ok})",
+                            'RSI': vals['rsi']
+                        })
+                    st.dataframe(pd.DataFrame(radar_list), use_container_width=True)
+                else:
+                    st.info("Piyasa verileri analiz ediliyor...")
+            else:
+                st.info("Radar sistemi veri topluyor, lütfen bekleyin...")
 
     # --- 2. GRID TAB ---
     with tabs[1]:
