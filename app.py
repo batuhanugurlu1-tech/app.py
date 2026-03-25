@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import firebase_admin
 from firebase_admin import credentials, firestore
 import json
@@ -21,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # 🎨 UI & TEMA AYARLARI
 # ==========================================
-st.set_page_config(page_title="QUANT OMNI V9.12 PRO", layout="wide")
+st.set_page_config(page_title="QUANT OMNI V9.13 PRO", layout="wide")
 
 st.markdown("""
     <style>
@@ -42,13 +44,60 @@ st.markdown("""
 VALID_SYMBOL_PATTERN = re.compile(r'^[A-Z0-9]{2,20}$')
 VALID_INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
 
+# UI'da sunulan sabit seçenekler
+AVAILABLE_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+AVAILABLE_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+GRID_COINS = ["BTCUSDT", "ETHUSDT"]
+
+# History sorgu limiti — Firestore okuma kotasını korur
+HISTORY_QUERY_LIMIT = 500
+
+
 def is_valid_symbol(symbol: str) -> bool:
     """Binance sembol adını doğrular — injection koruması."""
     return isinstance(symbol, str) and bool(VALID_SYMBOL_PATTERN.match(symbol))
 
+
 def is_valid_interval(interval: str) -> bool:
     """Binance interval parametresini doğrular — URL injection koruması."""
     return isinstance(interval, str) and interval in VALID_INTERVALS
+
+
+def safe_float(val, default: float = 0.0) -> float:
+    """Herhangi bir değeri güvenli float'a çevirir. Firestore bazen string döndürür."""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(val, default: int = 0) -> int:
+    """Herhangi bir değeri güvenli int'e çevirir."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+# ==========================================
+# 🌐 HTTP SESSION (Connection Pooling)
+# ==========================================
+@st.cache_resource
+def get_http_session():
+    """Tek bir requests.Session döndürür — TCP connection reuse sağlar.
+    3 motorda her biri 20-45 sn'de istek atıyor, session ile
+    TCP handshake tekrarı önlenir."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=2,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=5, pool_maxsize=10)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
 
 # ==========================================
 # ☁️ FIREBASE SINGLETON
@@ -75,8 +124,10 @@ def get_db():
             return None
     return firestore.client()
 
+
 db = get_db()
 app_id = os.environ.get('APP_ID', 'quant-lab-v9-pro')
+
 
 def get_data_ref(collection_name):
     """Firebase collection referansı döndürür. db None ise hata fırlatır."""
@@ -84,16 +135,19 @@ def get_data_ref(collection_name):
         raise RuntimeError("Firebase bağlantısı yok. get_data_ref çağrılamaz.")
     return db.collection('artifacts').document(app_id).collection('public').document('data').collection(collection_name)
 
+
 # ==========================================
 # 🛠️ YARDIMCI FONKSİYONLAR (TIP GÜVENLİĞİ)
 # ==========================================
 def safe_str_time(val) -> str:
-    """Herhangi bir zaman değerini güvenli string'e çevirir."""
+    """Herhangi bir zaman değerini güvenli string'e çevirir.
+    Firestore Timestamp, datetime, veya ISO string olabilir."""
     if isinstance(val, str):
         return val
     if hasattr(val, 'isoformat'):
         return val.isoformat()
     return str(val)
+
 
 def safe_short_time(val) -> str:
     """Zaman değerinden sadece saat kısmını çıkarır."""
@@ -104,10 +158,30 @@ def safe_short_time(val) -> str:
         return s.split(' ')[1][:8]
     return s[:8]
 
+
 def safe_display_time(val) -> str:
     """Zaman değerini 'YYYY-MM-DD HH:MM' formatına çevirir."""
     s = safe_str_time(val)
     return s.replace('T', ' ')[:16]
+
+
+def filter_valid_defaults(defaults, options):
+    """st.multiselect default listesinden options'ta olmayanları temizler.
+    Firestore'da options dışı coin varsa Streamlit crash'ini önler."""
+    if not isinstance(defaults, list):
+        return [options[0]] if options else []
+    filtered = [d for d in defaults if d in options]
+    return filtered if filtered else [options[0]] if options else []
+
+
+def safe_selectbox_index(value, options, fallback_index=0):
+    """st.selectbox için güvenli index döndürür.
+    Firestore'daki değer options'ta yoksa fallback kullanır."""
+    try:
+        return options.index(value)
+    except ValueError:
+        return fallback_index
+
 
 # ==========================================
 # 📊 BİLİMSEL İNDİKATÖR MOTORU
@@ -123,8 +197,8 @@ def calculate_advanced_indicators(df, fast_ema, slow_ema):
 
     # RSI — sıfıra bölünme koruması
     delta = df['C'].diff()
-    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1 / 14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     df['RSI'] = (100 - (100 / (1 + rs))).fillna(100.0)
 
@@ -134,7 +208,7 @@ def calculate_advanced_indicators(df, fast_ema, slow_ema):
         np.abs(df['H'] - df['C'].shift()),
         np.abs(df['L'] - df['C'].shift())
     ], axis=1).max(axis=1)
-    df['ATR'] = tr.ewm(alpha=1/14, adjust=False).mean()
+    df['ATR'] = tr.ewm(alpha=1 / 14, adjust=False).mean()
 
     # ADX — sıfıra bölünme koruması
     up_move = df['H'] - df['H'].shift(1)
@@ -143,14 +217,15 @@ def calculate_advanced_indicators(df, fast_ema, slow_ema):
     minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
 
     atr_safe = df['ATR'].replace(0, np.nan)
-    plus_di = 100 * (plus_dm.ewm(alpha=1/14, adjust=False).mean() / atr_safe)
-    minus_di = 100 * (minus_dm.ewm(alpha=1/14, adjust=False).mean() / atr_safe)
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_safe)
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_safe)
 
     di_sum = (plus_di + minus_di).replace(0, np.nan)
     dx = (100 * np.abs(plus_di - minus_di) / di_sum).fillna(0)
-    df['ADX'] = dx.ewm(alpha=1/14, adjust=False).mean()
+    df['ADX'] = dx.ewm(alpha=1 / 14, adjust=False).mean()
 
     return df
+
 
 def fetch_klines(symbol, interval, limit=100):
     if not is_valid_symbol(symbol):
@@ -160,8 +235,9 @@ def fetch_klines(symbol, interval, limit=100):
         logger.warning(f"Geçersiz interval reddedildi: {interval}")
         return pd.DataFrame()
     try:
+        session = get_http_session()
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        res = requests.get(url, timeout=10)
+        res = session.get(url, timeout=10)
         if res.status_code != 200:
             return pd.DataFrame()
         try:
@@ -183,6 +259,7 @@ def fetch_klines(symbol, interval, limit=100):
         logger.error(f"API Error ({symbol}): {e}")
         return pd.DataFrame()
 
+
 # ==========================================
 # ⚙️ ARKA PLAN MOTORLARI (KORUMALI)
 # ==========================================
@@ -200,17 +277,23 @@ def whale_engine():
 
                 if configs and configs.get('autopilot', False):
                     coins = configs.get('coins', [])
+                    if not isinstance(coins, list):
+                        coins = []
                     timeframe = configs.get('timeframe', '1h')
                     if not is_valid_interval(timeframe):
                         timeframe = '1h'
-                    ema_f_period = int(configs.get('ema_f', 9))
-                    ema_s_period = int(configs.get('ema_s', 21))
-                    adx_threshold = float(configs.get('adx_t', 15))
-                    margin = float(configs.get('margin', 300))
-                    leverage = float(configs.get('leverage', 3))
-                    tp_atr = float(configs.get('tp_atr', 3.5))
+                    ema_f_period = safe_int(configs.get('ema_f', 9), 9)
+                    ema_s_period = safe_int(configs.get('ema_s', 21), 21)
+                    adx_threshold = safe_float(configs.get('adx_t', 15), 15.0)
+                    margin = safe_float(configs.get('margin', 300), 300.0)
+                    leverage = safe_float(configs.get('leverage', 3), 3.0)
+                    tp_atr = safe_float(configs.get('tp_atr', 3.5), 3.5)
 
-                    current_status = {}
+                    # Negatif/sıfır parametre koruması
+                    if ema_f_period <= 0 or ema_s_period <= 0 or margin <= 0 or leverage <= 0:
+                        logger.warning("Whale: Geçersiz config parametreleri, atlanıyor.")
+                        time.sleep(45)
+                        continue
 
                     for symbol in coins:
                         if not is_valid_symbol(symbol):
@@ -220,19 +303,19 @@ def whale_engine():
                             continue
 
                         df = calculate_advanced_indicators(raw_df, ema_f_period, ema_s_period)
+
+                        # İndikatör hesaplaması sonrası yeterli veri kontrolü
+                        if len(df) < 2:
+                            continue
+
                         current, prev = df.iloc[-1], df.iloc[-2]
-                        price = float(current['C'])
+                        price = safe_float(current['C'])
                         if price <= 0:
                             continue
-                        
-                        # RADAR İÇİN DURUM KAYDI (Arayüze Yansıtılacak)
-                        current_status[symbol] = {
-                            'price': round(price, 4),
-                            'ema_f': round(float(current['EMA_F']), 4),
-                            'ema_s': round(float(current['EMA_S']), 4),
-                            'rsi': round(float(current['RSI']), 2),
-                            'adx': round(float(current['ADX']), 2)
-                        }
+
+                        # NaN indikatör kontrolü — warmup dönemi
+                        if pd.isna(current['EMA_F']) or pd.isna(current['EMA_S']) or pd.isna(current['RSI']) or pd.isna(current['ADX']) or pd.isna(current['ATR']):
+                            continue
 
                         pos_ref = get_data_ref('active_trades').document(f"trend_{symbol}")
                         pos_doc = pos_ref.get()
@@ -240,9 +323,9 @@ def whale_engine():
                         if pos_doc.exists:
                             p = pos_doc.to_dict()
                             res = ""
-                            p_sl = float(p.get('sl', 0))
-                            p_tp = float(p.get('tp', 0))
-                            p_entry = float(p.get('entry', price))
+                            p_sl = safe_float(p.get('sl', 0))
+                            p_tp = safe_float(p.get('tp', 0))
+                            p_entry = safe_float(p.get('entry', price))
                             p_type = p.get('type', 'LONG')
 
                             if p_entry <= 0:
@@ -261,7 +344,8 @@ def whale_engine():
                                     res = "WIN"
 
                             if res:
-                                pnl = ((price - p_entry) / p_entry * 100) if p_type == 'LONG' else ((p_entry - price) / p_entry * 100)
+                                pnl = ((price - p_entry) / p_entry * 100) if p_type == 'LONG' else (
+                                    (p_entry - price) / p_entry * 100)
                                 get_data_ref('history').add({
                                     'bot': 'trend', 'symbol': symbol,
                                     'pnl_usd': round((margin * pnl * leverage) / 100, 2),
@@ -269,7 +353,7 @@ def whale_engine():
                                 })
                                 pos_ref.delete()
                         else:
-                            atr_val = float(current['ATR'])
+                            atr_val = safe_float(current['ATR'])
                             if atr_val <= 0:
                                 continue
                             if (prev['EMA_F'] <= prev['EMA_S'] and
@@ -294,24 +378,15 @@ def whale_engine():
                                     'margin': margin, 'leverage': leverage,
                                     'symbol': symbol, 'time': datetime.now().isoformat()
                                 })
-                    
-                    # Radar durumunu buluta kaydet (Arayüz okuyabilsin diye)
-                    try:
-                        if current_status:
-                            get_data_ref('states').document('trend_status').set({
-                                'data': current_status,
-                                'updated': datetime.now().isoformat()
-                            })
-                    except Exception as e:
-                        logger.error(f"Trend radar update error: {e}")
-
                 time.sleep(45)
             except Exception as e:
                 logger.error(f"Whale Error: {e}")
                 time.sleep(30)
+
     t = threading.Thread(target=task, daemon=True)
     t.start()
     return t
+
 
 @st.cache_resource
 def ant_engine():
@@ -331,20 +406,21 @@ def ant_engine():
                         time.sleep(20)
                         continue
 
-                    spacing = float(configs.get('grid_spacing_pct', 0.5))
-                    margin = float(configs.get('margin_per_grid', 100))
-                    max_grids = int(configs.get('max_grids', 50))
-                    if spacing <= 0:
-                        logger.warning("Grid spacing <= 0, atlanıyor")
+                    spacing = safe_float(configs.get('grid_spacing_pct', 0.5), 0.5)
+                    margin = safe_float(configs.get('margin_per_grid', 100), 100.0)
+                    max_grids = safe_int(configs.get('max_grids', 50), 50)
+                    if spacing <= 0 or margin <= 0 or max_grids <= 0:
+                        logger.warning("Ant: Geçersiz config parametreleri, atlanıyor")
                         time.sleep(20)
                         continue
 
-                    res = requests.get(
+                    session = get_http_session()
+                    res = session.get(
                         f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
                         timeout=10
                     )
                     if res.status_code == 200:
-                        price = float(res.json().get('price', 0))
+                        price = safe_float(res.json().get('price', 0))
                         if price > 0:
                             state_ref = get_data_ref('states').document('grid')
                             state_doc = state_ref.get()
@@ -353,11 +429,13 @@ def ant_engine():
                             }
 
                             grids = state.get('grids', [])
+                            if not isinstance(grids, list):
+                                grids = []
                             new_grids = []
-                            total_prof = float(state.get('total_profit', 0.0))
+                            total_prof = safe_float(state.get('total_profit', 0.0))
 
                             for g in grids:
-                                g_entry = float(g.get('entry', 0))
+                                g_entry = safe_float(g.get('entry', 0))
                                 if g_entry <= 0:
                                     continue
                                 if price >= g_entry * (1 + spacing / 100):
@@ -373,7 +451,8 @@ def ant_engine():
                                     new_grids.append(g)
 
                             if len(new_grids) < max_grids:
-                                entries = [float(x.get('entry', 0)) for x in new_grids if float(x.get('entry', 0)) > 0]
+                                entries = [safe_float(x.get('entry', 0)) for x in new_grids]
+                                entries = [e for e in entries if e > 0]
                                 last_buy = min(entries) if entries else price
                                 if price <= last_buy * (1 - spacing / 100) or not new_grids:
                                     new_grids.append({
@@ -391,9 +470,11 @@ def ant_engine():
             except Exception as e:
                 logger.error(f"Ant Error: {e}")
                 time.sleep(20)
+
     t = threading.Thread(target=task, daemon=True)
     t.start()
     return t
+
 
 @st.cache_resource
 def falcon_engine():
@@ -408,11 +489,16 @@ def falcon_engine():
                 configs = doc.to_dict() if doc.exists else {}
 
                 if configs and configs.get('autopilot', False):
-                    vol_spike_threshold = float(configs.get('vol_spike', 5.0))
-                    margin = float(configs.get('margin', 200))
-                    leverage = float(configs.get('leverage', 5))
-                    tp_pct = float(configs.get('tp_pct', 5.0))
-                    sl_pct = float(configs.get('sl_pct', 3.0))
+                    vol_spike_threshold = safe_float(configs.get('vol_spike', 5.0), 5.0)
+                    margin = safe_float(configs.get('margin', 200), 200.0)
+                    leverage = safe_float(configs.get('leverage', 5), 5.0)
+                    tp_pct = safe_float(configs.get('tp_pct', 5.0), 5.0)
+                    sl_pct = safe_float(configs.get('sl_pct', 3.0), 3.0)
+
+                    if margin <= 0 or leverage <= 0 or tp_pct <= 0 or sl_pct <= 0:
+                        logger.warning("Falcon: Geçersiz config parametreleri, atlanıyor")
+                        time.sleep(30)
+                        continue
 
                     pos_ref = get_data_ref('active_trades').document('flash_pos')
                     pos_doc = pos_ref.get()
@@ -425,13 +511,14 @@ def falcon_engine():
                             time.sleep(30)
                             continue
 
-                        p_res = requests.get(
+                        session = get_http_session()
+                        p_res = session.get(
                             f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
                             timeout=10
                         )
                         if p_res.status_code == 200:
-                            price = float(p_res.json().get('price', 0))
-                            p_entry = float(p.get('entry', 0))
+                            price = safe_float(p_res.json().get('price', 0))
+                            p_entry = safe_float(p.get('entry', 0))
                             p_type = p.get('type', 'LONG')
                             if p_entry <= 0:
                                 pos_ref.delete()
@@ -439,13 +526,14 @@ def falcon_engine():
                                 continue
 
                             res_str = ""
-                            if price <= float(p.get('sl', 0)):
+                            if price <= safe_float(p.get('sl', 0)):
                                 res_str = "LOSS"
-                            elif price >= float(p.get('tp', 0)):
+                            elif price >= safe_float(p.get('tp', 0)):
                                 res_str = "WIN"
 
                             if res_str:
-                                pnl = ((price - p_entry) / p_entry * 100) if p_type == 'LONG' else ((p_entry - price) / p_entry * 100)
+                                pnl = ((price - p_entry) / p_entry * 100) if p_type == 'LONG' else (
+                                    (p_entry - price) / p_entry * 100)
                                 get_data_ref('history').add({
                                     'bot': 'flash', 'symbol': symbol,
                                     'pnl_usd': round((margin * pnl * leverage) / 100, 2),
@@ -454,27 +542,39 @@ def falcon_engine():
                                 })
                                 pos_ref.delete()
                     else:
-                        res = requests.get(
+                        session = get_http_session()
+                        res = session.get(
                             "https://api.binance.com/api/v3/ticker/24hr",
                             timeout=10
                         )
                         if res.status_code == 200:
                             try:
                                 ticks = res.json()
-                                spikes = [
-                                    t for t in ticks
-                                    if float(t.get('priceChangePercent', 0)) > vol_spike_threshold
-                                    and t.get('symbol', '').endswith('USDT')
-                                    and is_valid_symbol(t.get('symbol', ''))
-                                ]
+                                if not isinstance(ticks, list):
+                                    time.sleep(30)
+                                    continue
+
+                                # Her ticker'ı ayrı ayrı parse et —
+                                # tek bozuk ticker tüm listeyi öldürmesin
+                                spikes = []
+                                for t in ticks:
+                                    try:
+                                        change = float(t.get('priceChangePercent', 0))
+                                        sym = t.get('symbol', '')
+                                        if (change > vol_spike_threshold
+                                                and sym.endswith('USDT')
+                                                and is_valid_symbol(sym)):
+                                            spikes.append(t)
+                                    except (ValueError, TypeError):
+                                        continue
+
                                 if spikes:
-                                    top = sorted(
+                                    top = max(
                                         spikes,
-                                        key=lambda x: float(x.get('quoteVolume', 0)),
-                                        reverse=True
-                                    )[0]
+                                        key=lambda x: safe_float(x.get('quoteVolume', 0))
+                                    )
                                     symbol = top['symbol']
-                                    price = float(top['lastPrice'])
+                                    price = safe_float(top.get('lastPrice', 0))
                                     if price > 0:
                                         pos_ref.set({
                                             'type': 'LONG', 'entry': price,
@@ -486,19 +586,21 @@ def falcon_engine():
                                         })
                                         get_data_ref('signals').document('flash').set({
                                             'symbol': symbol,
-                                            'change': top['priceChangePercent'],
-                                            'vol': top['quoteVolume'],
+                                            'change': top.get('priceChangePercent', '0'),
+                                            'vol': top.get('quoteVolume', '0'),
                                             'time': datetime.now().isoformat()
                                         })
-                            except (ValueError, KeyError) as e:
+                            except Exception as e:
                                 logger.warning(f"Falcon parse error: {e}")
                 time.sleep(30)
             except Exception as e:
                 logger.error(f"Falcon Error: {e}")
                 time.sleep(30)
+
     t = threading.Thread(target=task, daemon=True)
     t.start()
     return t
+
 
 # ==========================================
 # 🖥️ MERKEZİ KONTROL ARAYÜZÜ (ŞEFFAF MOD)
@@ -526,8 +628,23 @@ def calculate_bot_stats(history_data, bot_name):
     return total, win_rate, total_pnl
 
 
+def safe_render_dataframe(data_list, rename_map, desired_order=None):
+    """DataFrame oluşturur, güvenli rename yapar, sadece mevcut sütunları gösterir.
+    Tekrarlanan UI kalıbını DRY hale getirir."""
+    if not data_list:
+        return None
+    df = pd.DataFrame(data_list)
+    existing_renames = {k: v for k, v in rename_map.items() if k in df.columns}
+    df = df.rename(columns=existing_renames)
+    if desired_order:
+        display_cols = [v for v in desired_order if v in df.columns]
+    else:
+        display_cols = [v for v in rename_map.values() if v in df.columns]
+    return df[display_cols] if display_cols else df
+
+
 def main():
-    st.title("🛡️ QUANT OMNI SENTINEL V9.12 PRO")
+    st.title("🛡️ QUANT OMNI SENTINEL V9.13 PRO")
 
     if db:
         st.markdown(
@@ -538,7 +655,9 @@ def main():
         ant_engine()
         falcon_engine()
 
-        hist_docs = get_data_ref('history').get()
+        # History sorgusuna limit koy — Firestore okuma kotasını korur
+        hist_query = get_data_ref('history').order_by('time', direction=firestore.Query.DESCENDING).limit(HISTORY_QUERY_LIMIT)
+        hist_docs = hist_query.get()
         all_history = [h.to_dict() for h in hist_docs] if hist_docs else []
     else:
         st.markdown(
@@ -565,23 +684,26 @@ def main():
             doc = get_data_ref('configs').document('trend').get()
             cfg = doc.to_dict() if doc.exists else {}
             with st.form("t_cfg"):
-                m = st.number_input("İşlem Marjini ($)", 10, 5000, int(cfg.get('margin', 300)))
-                l = st.slider("Kaldıraç (x)", 1, 20, int(cfg.get('leverage', 3)))
+                m = st.number_input("İşlem Marjini ($)", 10, 5000, safe_int(cfg.get('margin', 300), 300))
+                l = st.slider("Kaldıraç (x)", 1, 20, safe_int(cfg.get('leverage', 3), 3))
+
+                # Multiselect default güvenliği — options dışı coin crash'i önler
+                saved_coins = cfg.get('coins', ["BTCUSDT"])
                 coins = st.multiselect(
                     "Varlıklar",
-                    ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-                    default=cfg.get('coins', ["BTCUSDT"])
+                    AVAILABLE_COINS,
+                    default=filter_valid_defaults(saved_coins, AVAILABLE_COINS)
                 )
-                tf_opts = ["15m", "1h", "4h", "1d"]
+
                 current_tf = cfg.get('timeframe', '1h')
                 tf = st.selectbox(
-                    "Zaman Dilimi", tf_opts,
-                    index=tf_opts.index(current_tf) if current_tf in tf_opts else 1
+                    "Zaman Dilimi", AVAILABLE_TIMEFRAMES,
+                    index=safe_selectbox_index(current_tf, AVAILABLE_TIMEFRAMES, 1)
                 )
-                ema_f = st.slider("Hızlı EMA", 5, 50, int(cfg.get('ema_f', 9)))
-                ema_s = st.slider("Yavaş EMA", 10, 200, int(cfg.get('ema_s', 21)))
-                adx_t = st.slider("ADX Filtresi (Gürültü Önleyici)", 0, 40, int(cfg.get('adx_t', 15)))
-                tp_atr = st.slider("Kâr Hedefi (ATR x)", 1.0, 6.0, float(cfg.get('tp_atr', 3.5)))
+                ema_f = st.slider("Hızlı EMA", 5, 50, safe_int(cfg.get('ema_f', 9), 9))
+                ema_s = st.slider("Yavaş EMA", 10, 200, safe_int(cfg.get('ema_s', 21), 21))
+                adx_t = st.slider("ADX Filtresi (Gürültü Önleyici)", 0, 40, safe_int(cfg.get('adx_t', 15), 15))
+                tp_atr = st.slider("Kâr Hedefi (ATR x)", 1.0, 6.0, float(min(max(safe_float(cfg.get('tp_atr', 3.5), 3.5), 1.0), 6.0)))
 
                 auto = st.checkbox("Otopilot Aktif", value=cfg.get('autopilot', False))
                 if st.form_submit_button("Ayarları Kaydet"):
@@ -597,44 +719,16 @@ def main():
             active_docs = get_data_ref('active_trades').get()
             trend_trades = [a.to_dict() for a in active_docs if a.id.startswith('trend_')]
             if trend_trades:
-                df_t = pd.DataFrame(trend_trades)
                 rename_map = {
                     'symbol': 'Varlık', 'type': 'Yön', 'entry': 'Giriş Fiyatı',
                     'tp': 'Kâr Al', 'sl': 'Zarar Kes', 'margin': 'Marjin($)'
                 }
-                existing_renames = {k: v for k, v in rename_map.items() if k in df_t.columns}
-                df_t = df_t.rename(columns=existing_renames)
-                display_cols = [v for v in rename_map.values() if v in df_t.columns]
-                if display_cols:
-                    st.dataframe(df_t[display_cols], use_container_width=True)
-                else:
+                df_t = safe_render_dataframe(trend_trades, rename_map)
+                if df_t is not None:
                     st.dataframe(df_t, use_container_width=True)
                 st.markdown("""<div class='action-box'><b>⚡ Ne Olacak?</b> Fiyat 'Kâr Al' seviyesine gelirse işlem kazançla kapatılacak. 'Zarar Kes' seviyesine düşerse zararla kapatılıp fon korunacak.</div>""", unsafe_allow_html=True)
             else:
                 st.info("Şu an açık Trend işlemi yok. Sistem yeni EMA kesişimi ve yeterli ADX gücü bekliyor.")
-
-            # YENİ EKLENEN RADAR SİSTEMİ
-            st.markdown("#### `📡 CANLI SİNYAL RADARI`")
-            status_doc = get_data_ref('states').document('trend_status').get()
-            if status_doc.exists:
-                status_data = status_doc.to_dict().get('data', {})
-                if status_data:
-                    radar_list = []
-                    adx_thresh = float(cfg.get('adx_t', 15))
-                    for sym, vals in status_data.items():
-                        ema_cross = "🟢 Yükseliş" if vals['ema_f'] > vals['ema_s'] else "🔴 Düşüş"
-                        adx_ok = "✅ Yeterli" if vals['adx'] >= adx_thresh else "⏳ Zayıf (Bekliyor)"
-                        radar_list.append({
-                            'Varlık': sym,
-                            'Trend Yönü': ema_cross,
-                            'Güç (ADX)': f"{vals['adx']} ({adx_ok})",
-                            'RSI': vals['rsi']
-                        })
-                    st.dataframe(pd.DataFrame(radar_list), use_container_width=True)
-                else:
-                    st.info("Piyasa verileri analiz ediliyor...")
-            else:
-                st.info("Radar sistemi veri topluyor, lütfen bekleyin...")
 
     # --- 2. GRID TAB ---
     with tabs[1]:
@@ -655,20 +749,20 @@ def main():
                 current_coin = cfg_grid.get('coin', 'BTCUSDT')
                 coin = st.selectbox(
                     "Güvenli Liman",
-                    ["BTCUSDT", "ETHUSDT"],
-                    index=0 if current_coin == "BTCUSDT" else 1
+                    GRID_COINS,
+                    index=safe_selectbox_index(current_coin, GRID_COINS, 0)
                 )
                 space = st.number_input(
                     "Ağ Aralığı (%)", 0.1, 5.0,
-                    float(cfg_grid.get('grid_spacing_pct', 0.5))
+                    float(min(max(safe_float(cfg_grid.get('grid_spacing_pct', 0.5), 0.5), 0.1), 5.0))
                 )
                 m_grid = st.number_input(
                     "Parça Başı Bütçe ($)", 10, 500,
-                    int(cfg_grid.get('margin_per_grid', 100))
+                    safe_int(cfg_grid.get('margin_per_grid', 100), 100)
                 )
                 max_g = st.number_input(
                     "Maksimum Ağ Sayısı", 10, 100,
-                    int(cfg_grid.get('max_grids', 50))
+                    safe_int(cfg_grid.get('max_grids', 50), 50)
                 )
                 auto_g = st.checkbox("Otopilot Aktif", value=cfg_grid.get('autopilot', False))
                 if st.form_submit_button("Ayarları Kaydet"):
@@ -684,9 +778,9 @@ def main():
             if state.exists:
                 state_dict = state.to_dict()
                 grids_list = state_dict.get('grids', [])
-                if grids_list:
+                if isinstance(grids_list, list) and grids_list:
                     df_g = pd.DataFrame(grids_list)
-                    space_pct = float(cfg_grid.get('grid_spacing_pct', 0.5))
+                    space_pct = safe_float(cfg_grid.get('grid_spacing_pct', 0.5), 0.5)
 
                     if 'entry' in df_g.columns:
                         df_g['entry'] = pd.to_numeric(df_g['entry'], errors='coerce').fillna(0)
@@ -731,14 +825,14 @@ def main():
         c1, c2 = st.columns([1, 2])
         with c1:
             doc = get_data_ref('configs').document('flash').get()
-            cfg = doc.to_dict() if doc.exists else {}
+            cfg_flash = doc.to_dict() if doc.exists else {}
             with st.form("f_cfg"):
-                m_flash = st.number_input("İşlem Marjini ($)", 10, 5000, int(cfg.get('margin', 200)))
-                l_flash = st.slider("Kaldıraç (x)", 1, 20, int(cfg.get('leverage', 5)))
-                tp_pct_input = st.number_input("Kâr Hedefi (%)", 1.0, 20.0, float(cfg.get('tp_pct', 5.0)))
-                sl_pct_input = st.number_input("Zarar Kes (%)", 1.0, 20.0, float(cfg.get('sl_pct', 3.0)))
-                f_s = st.slider("Hacim Patlama Eşiği (%)", 2.0, 50.0, float(cfg.get('vol_spike', 10.0)))
-                f_a = st.checkbox("Otopilot Aktif", value=cfg.get('autopilot', False))
+                m_flash = st.number_input("İşlem Marjini ($)", 10, 5000, safe_int(cfg_flash.get('margin', 200), 200))
+                l_flash = st.slider("Kaldıraç (x)", 1, 20, safe_int(cfg_flash.get('leverage', 5), 5))
+                tp_pct_input = st.number_input("Kâr Hedefi (%)", 1.0, 20.0, float(min(max(safe_float(cfg_flash.get('tp_pct', 5.0), 5.0), 1.0), 20.0)))
+                sl_pct_input = st.number_input("Zarar Kes (%)", 1.0, 20.0, float(min(max(safe_float(cfg_flash.get('sl_pct', 3.0), 3.0), 1.0), 20.0)))
+                f_s = st.slider("Hacim Patlama Eşiği (%)", 2.0, 50.0, float(min(max(safe_float(cfg_flash.get('vol_spike', 10.0), 10.0), 2.0), 50.0)))
+                f_a = st.checkbox("Otopilot Aktif", value=cfg_flash.get('autopilot', False))
                 if st.form_submit_button("Ayarları Kaydet"):
                     get_data_ref('configs').document('flash').set({
                         'margin': m_flash, 'leverage': l_flash,
@@ -751,17 +845,12 @@ def main():
             active_f = get_data_ref('active_trades').document('flash_pos').get()
             if active_f.exists:
                 p = active_f.to_dict()
-                df_flash = pd.DataFrame([p])
                 flash_rename = {
                     'symbol': 'Varlık', 'entry': 'Giriş Fiyatı',
                     'tp': 'Kâr Hedefi', 'sl': 'Stop Loss', 'margin': 'Bütçe($)'
                 }
-                existing_flash = {k: v for k, v in flash_rename.items() if k in df_flash.columns}
-                df_flash = df_flash.rename(columns=existing_flash)
-                display_flash = [v for v in flash_rename.values() if v in df_flash.columns]
-                if display_flash:
-                    st.dataframe(df_flash[display_flash], use_container_width=True)
-                else:
+                df_flash = safe_render_dataframe([p], flash_rename)
+                if df_flash is not None:
                     st.dataframe(df_flash, use_container_width=True)
                 st.markdown("""<div class='action-box'><b>⚡ Ne Olacak?</b> Vurgun yapıldı! Fiyat Kâr Hedefine ulaşırsa kazançla çıkılacak. Tersine dönerse Stop Loss devrede.</div>""", unsafe_allow_html=True)
             else:
@@ -813,6 +902,7 @@ def main():
 
     time.sleep(10)
     st.rerun()
+
 
 if __name__ == "__main__":
     main()
