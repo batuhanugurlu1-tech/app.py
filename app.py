@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # 🎨 UI & TEMA AYARLARI
 # ==========================================
-st.set_page_config(page_title="QUANT OMNI V9.16 PRO", layout="wide")
+st.set_page_config(page_title="QUANT OMNI V9.17 FINAL", layout="wide")
 
 st.markdown("""
     <style>
@@ -44,7 +44,7 @@ st.markdown("""
 VALID_SYMBOL_PATTERN = re.compile(r'^[A-Z0-9]{2,20}$')
 VALID_INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
 
-AVAILABLE_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+AVAILABLE_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "TAOUSDT", "AVAXUSDT"]
 AVAILABLE_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 GRID_COINS = ["BTCUSDT", "ETHUSDT"]
 HISTORY_QUERY_LIMIT = 500
@@ -69,8 +69,8 @@ def safe_int(val, default: int = 0) -> int:
 @st.cache_resource
 def get_http_session():
     session = requests.Session()
-    retry_strategy = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=5, pool_maxsize=10)
+    retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=20)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
@@ -96,7 +96,7 @@ def get_db():
     return firestore.client()
 
 db = get_db()
-app_id = os.environ.get('APP_ID', 'quant-lab-v9-pro')
+app_id = os.environ.get('APP_ID', 'quant-lab-v9-final')
 
 def get_data_ref(collection_name):
     if db is None: raise RuntimeError("Firebase bağlantısı yok.")
@@ -346,14 +346,14 @@ def falcon_engine():
                     leverage = safe_float(configs.get('leverage', 5), 5.0)
                     tp_pct = safe_float(configs.get('tp_pct', 5.0), 5.0)
                     sl_pct = safe_float(configs.get('sl_pct', 3.0), 3.0)
-                    cooldown_hours = 6  # Aynı coine girmemek için soğuma süresi
+                    cooldown_hours = 6
 
                     if margin <= 0 or leverage <= 0 or tp_pct <= 0 or sl_pct <= 0: time.sleep(30); continue
 
                     pos_ref = get_data_ref('active_trades').document('flash_pos')
                     pos_doc = pos_ref.get()
 
-                    # 1. ADIM: AKTİF İŞLEM VAR MI?
+                    # 1. ADIM: AKTİF İŞLEM
                     if pos_doc.exists:
                         p = pos_doc.to_dict()
                         symbol = p.get('symbol', '')
@@ -375,7 +375,6 @@ def falcon_engine():
                                 pnl = ((price - p_entry) / p_entry * 100) if p_type == 'LONG' else ((p_entry - price) / p_entry * 100)
                                 get_data_ref('history').add({'bot': 'flash', 'symbol': symbol, 'pnl_usd': round((margin * pnl * leverage) / 100, 2), 'result': res_str, 'time': datetime.now().isoformat()})
                                 
-                                # COOLDOWN YAZIMI
                                 get_data_ref('states').document('flash_cooldown').set({symbol: datetime.now().isoformat()}, merge=True)
                                 pos_ref.delete()
                     else:
@@ -448,7 +447,7 @@ def safe_render_dataframe(data_list, rename_map, desired_order=None):
     return df[display_cols] if display_cols else df
 
 def main():
-    st.title("🛡️ QUANT OMNI SENTINEL V9.16 PRO")
+    st.title("🛡️ QUANT OMNI SENTINEL V9.17 FINAL")
 
     if db:
         st.markdown('<div class="status-bar online">● SİSTEM ÇEVRİMİÇİ | 💠 KASA İZLENİYOR</div>', unsafe_allow_html=True)
@@ -651,24 +650,23 @@ def main():
     with tabs[3]:
         st.markdown("### 📊 Tüm Fonun Merkezi Analitiği")
         
-        # Hard Reset Butonu
-        if st.button("🗑️ İstatistikleri ve Kasayı Sıfırla (Hard Reset)", type="primary"):
+        # ULTIMATE HARD RESET (Mutlak Sıfırlama)
+        if st.button("🚨 Mutlak Sıfırlama (Tüm Verileri Sil)", type="primary", help="Ayarlarınız kalır, ancak işlem geçmişi, eldeki grid parçaları, aktif işlemler ve radar temizlenir."):
             try:
-                # Geçmişteki tüm işlemleri sil
-                docs = get_data_ref('history').stream()
-                for doc in docs:
-                    doc.reference.delete()
+                # 1. Geçmişi Sil
+                for doc in get_data_ref('history').stream(): doc.reference.delete()
+                # 2. Aktif İşlemleri Sil
+                for doc in get_data_ref('active_trades').stream(): doc.reference.delete()
+                # 3. Durumları Sil (Grid, Cooldown, Radar)
+                for doc in get_data_ref('states').stream(): doc.reference.delete()
+                # 4. Sinyalleri Sil
+                for doc in get_data_ref('signals').stream(): doc.reference.delete()
                 
-                # Grid botunun kâr kumbarasını sıfırla
-                grid_state = get_data_ref('states').document('grid')
-                if grid_state.get().exists:
-                    grid_state.update({'total_profit': 0.0})
-                
-                st.success("Tüm istatistikler ve kasa geçmişi sıfırlandı! Yeni döneme hazır.")
+                st.success("Tüm sistem hafızası başarıyla silindi! Yeni döneme hazır.")
                 time.sleep(2)
                 st.rerun()
             except Exception as e:
-                st.error(f"Sıfırlama sırasında hata oluştu: {e}")
+                st.error(f"Sıfırlama sırasında hata: {e}")
 
         if all_history:
             df = pd.DataFrame(all_history)
