@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # 🎨 UI & TEMA AYARLARI
 # ==========================================
-st.set_page_config(page_title="QUANT OMNI V9.17 FINAL", layout="wide")
+st.set_page_config(page_title="QUANT OMNI V9.18 PRO", layout="wide")
 
 st.markdown("""
     <style>
@@ -96,7 +96,6 @@ def get_db():
     return firestore.client()
 
 db = get_db()
-# KRTİK DÜZELTME: Klasör adı tekrar eski verilerinin olduğu "quant-lab-v9-pro" yapıldı!
 app_id = os.environ.get('APP_ID', 'quant-lab-v9-pro')
 
 def get_data_ref(collection_name):
@@ -448,7 +447,7 @@ def safe_render_dataframe(data_list, rename_map, desired_order=None):
     return df[display_cols] if display_cols else df
 
 def main():
-    st.title("🛡️ QUANT OMNI SENTINEL V9.17 FINAL")
+    st.title("🛡️ QUANT OMNI SENTINEL V9.18 PRO")
 
     if db:
         st.markdown('<div class="status-bar online">● SİSTEM ÇEVRİMİÇİ | 💠 KASA İZLENİYOR</div>', unsafe_allow_html=True)
@@ -498,6 +497,18 @@ def main():
                 if st.form_submit_button("Ayarları Kaydet"):
                     get_data_ref('configs').document('trend').set({'margin': m, 'leverage': l, 'coins': coins, 'timeframe': tf, 'ema_f': ema_f, 'ema_s': ema_s, 'adx_t': adx_t, 'tp_atr': tp_atr, 'autopilot': auto})
                     st.rerun()
+            
+            # MODÜLER SIFIRLAMA: TREND
+            if st.button("🗑️ Trend Geçmişini Sıfırla"):
+                for doc in get_data_ref('history').stream():
+                    if doc.to_dict().get('bot') == 'trend': doc.reference.delete()
+                for doc in get_data_ref('active_trades').stream():
+                    if doc.id.startswith('trend_'): doc.reference.delete()
+                get_data_ref('states').document('trend_status').delete()
+                st.success("Sadece Trend verileri sıfırlandı!")
+                time.sleep(1)
+                st.rerun()
+
         with c2:
             st.markdown("#### `🟢 AKTİF İŞLEMLER VE BEKLENTİLER`")
             active_docs = get_data_ref('active_trades').get()
@@ -550,6 +561,16 @@ def main():
                 if st.form_submit_button("Ayarları Kaydet"):
                     get_data_ref('configs').document('grid').set({'coin': coin, 'grid_spacing_pct': space, 'margin_per_grid': m_grid, 'max_grids': max_g, 'autopilot': auto_g})
                     st.rerun()
+
+            # MODÜLER SIFIRLAMA: GRID
+            if st.button("🗑️ Grid Kumbarasını Sıfırla"):
+                for doc in get_data_ref('history').stream():
+                    if doc.to_dict().get('bot') == 'grid': doc.reference.delete()
+                get_data_ref('states').document('grid').delete()
+                st.success("Grid geçmişi ve açık parçalar sıfırlandı!")
+                time.sleep(1)
+                st.rerun()
+
         with c2:
             st.markdown("#### `🐜 ELDEKİ PARÇALAR (PUSUDAKİLER)`")
             state = get_data_ref('states').document('grid').get()
@@ -605,10 +626,15 @@ def main():
                 if st.form_submit_button("Ayarları Kaydet"):
                     get_data_ref('configs').document('flash').set({'margin': m_flash, 'leverage': l_flash, 'tp_pct': tp_pct_input, 'sl_pct': sl_pct_input, 'vol_spike': f_s, 'autopilot': f_a})
                     st.rerun()
-            
-            if st.button("♻️ Kara Listeyi (Cooldown) Temizle"):
+
+            # MODÜLER SIFIRLAMA: FLASH
+            if st.button("🗑️ Flash Geçmişini Sıfırla"):
+                for doc in get_data_ref('history').stream():
+                    if doc.to_dict().get('bot') == 'flash': doc.reference.delete()
+                get_data_ref('active_trades').document('flash_pos').delete()
+                get_data_ref('signals').document('flash').delete()
                 get_data_ref('states').document('flash_cooldown').delete()
-                st.success("Hafıza temizlendi, tüm coinler tekrar taranabilir!")
+                st.success("Flash geçmişi ve soğuma listesi tamamen silindi!")
                 time.sleep(1)
                 st.rerun()
 
@@ -652,22 +678,17 @@ def main():
         st.markdown("### 📊 Tüm Fonun Merkezi Analitiği")
         
         # ULTIMATE HARD RESET (Mutlak Sıfırlama)
-        if st.button("🚨 Mutlak Sıfırlama (Tüm Verileri Sil)", type="primary", help="Ayarlarınız kalır, ancak işlem geçmişi, eldeki grid parçaları, aktif işlemler ve radar temizlenir."):
+        if st.button("🚨 Tüm Sistemi Sıfırla", type="primary", help="Tüm botların geçmişini ve pozisyonlarını siler."):
             try:
-                # 1. Geçmişi Sil
                 for doc in get_data_ref('history').stream(): doc.reference.delete()
-                # 2. Aktif İşlemleri Sil
                 for doc in get_data_ref('active_trades').stream(): doc.reference.delete()
-                # 3. Durumları Sil (Grid, Cooldown, Radar)
                 for doc in get_data_ref('states').stream(): doc.reference.delete()
-                # 4. Sinyalleri Sil
                 for doc in get_data_ref('signals').stream(): doc.reference.delete()
-                
-                st.success("Tüm sistem hafızası başarıyla silindi! Yeni döneme hazır.")
+                st.success("Tüm sistem başarıyla sıfırlandı!")
                 time.sleep(2)
                 st.rerun()
             except Exception as e:
-                st.error(f"Sıfırlama sırasında hata: {e}")
+                st.error(f"Hata: {e}")
 
         if all_history:
             df = pd.DataFrame(all_history)
@@ -695,3 +716,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
