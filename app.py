@@ -96,7 +96,8 @@ def get_db():
     return firestore.client()
 
 db = get_db()
-app_id = os.environ.get('APP_ID', 'quant-lab-v9-final')
+# KRTİK DÜZELTME: Klasör adı tekrar eski verilerinin olduğu "quant-lab-v9-pro" yapıldı!
+app_id = os.environ.get('APP_ID', 'quant-lab-v9-pro')
 
 def get_data_ref(collection_name):
     if db is None: raise RuntimeError("Firebase bağlantısı yok.")
@@ -694,5 +695,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
