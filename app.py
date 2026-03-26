@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # 🎨 UI & TEMA AYARLARI
 # ==========================================
-st.set_page_config(page_title="QUANT OMNI V9.15 PRO", layout="wide")
+st.set_page_config(page_title="QUANT OMNI V9.16 PRO", layout="wide")
 
 st.markdown("""
     <style>
@@ -375,7 +375,7 @@ def falcon_engine():
                                 pnl = ((price - p_entry) / p_entry * 100) if p_type == 'LONG' else ((p_entry - price) / p_entry * 100)
                                 get_data_ref('history').add({'bot': 'flash', 'symbol': symbol, 'pnl_usd': round((margin * pnl * leverage) / 100, 2), 'result': res_str, 'time': datetime.now().isoformat()})
                                 
-                                # COOLDOWN YAZIMI (İşlem kapandığında o coini kara listeye al)
+                                # COOLDOWN YAZIMI
                                 get_data_ref('states').document('flash_cooldown').set({symbol: datetime.now().isoformat()}, merge=True)
                                 pos_ref.delete()
                     else:
@@ -383,7 +383,6 @@ def falcon_engine():
                         session = get_http_session()
                         res = session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=10)
                         
-                        # Soğuma verisini çek
                         cd_doc = get_data_ref('states').document('flash_cooldown').get()
                         cooldowns = cd_doc.to_dict() if cd_doc.exists else {}
                         now = datetime.now()
@@ -399,7 +398,6 @@ def falcon_engine():
                                         change = float(t.get('priceChangePercent', 0))
                                         sym = t.get('symbol', '')
                                         if change > vol_spike_threshold and sym.endswith('USDT') and is_valid_symbol(sym):
-                                            # COOLDOWN KONTROLÜ
                                             last_trade_str = cooldowns.get(sym)
                                             is_cooling_down = False
                                             if last_trade_str:
@@ -450,7 +448,7 @@ def safe_render_dataframe(data_list, rename_map, desired_order=None):
     return df[display_cols] if display_cols else df
 
 def main():
-    st.title("🛡️ QUANT OMNI SENTINEL V9.15 PRO")
+    st.title("🛡️ QUANT OMNI SENTINEL V9.16 PRO")
 
     if db:
         st.markdown('<div class="status-bar online">● SİSTEM ÇEVRİMİÇİ | 💠 KASA İZLENİYOR</div>', unsafe_allow_html=True)
@@ -608,10 +606,10 @@ def main():
                     get_data_ref('configs').document('flash').set({'margin': m_flash, 'leverage': l_flash, 'tp_pct': tp_pct_input, 'sl_pct': sl_pct_input, 'vol_spike': f_s, 'autopilot': f_a})
                     st.rerun()
             
-            # Cooldown temizleme butonu
             if st.button("♻️ Kara Listeyi (Cooldown) Temizle"):
                 get_data_ref('states').document('flash_cooldown').delete()
                 st.success("Hafıza temizlendi, tüm coinler tekrar taranabilir!")
+                time.sleep(1)
                 st.rerun()
 
         with c2:
@@ -652,6 +650,26 @@ def main():
     # --- 4. ANALYTICS TAB ---
     with tabs[3]:
         st.markdown("### 📊 Tüm Fonun Merkezi Analitiği")
+        
+        # Hard Reset Butonu
+        if st.button("🗑️ İstatistikleri ve Kasayı Sıfırla (Hard Reset)", type="primary"):
+            try:
+                # Geçmişteki tüm işlemleri sil
+                docs = get_data_ref('history').stream()
+                for doc in docs:
+                    doc.reference.delete()
+                
+                # Grid botunun kâr kumbarasını sıfırla
+                grid_state = get_data_ref('states').document('grid')
+                if grid_state.get().exists:
+                    grid_state.update({'total_profit': 0.0})
+                
+                st.success("Tüm istatistikler ve kasa geçmişi sıfırlandı! Yeni döneme hazır.")
+                time.sleep(2)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Sıfırlama sırasında hata oluştu: {e}")
+
         if all_history:
             df = pd.DataFrame(all_history)
             df['pnl_usd'] = pd.to_numeric(df['pnl_usd'], errors='coerce').fillna(0.0) if 'pnl_usd' in df.columns else 0.0
@@ -670,7 +688,8 @@ def main():
             df = df.rename(columns=existing_analytics)
             display_analytics = ['Zaman'] + [v for v in analytics_rename.values() if v in df.columns]
             st.dataframe(df[display_analytics].sort_values('Zaman', ascending=False), width="stretch")
-        else: st.info("İstatistik verisi bekleniyor. İlk işlem kapandığında burada görünecektir.")
+        else: 
+            st.info("İstatistik verisi bekleniyor. İlk işlem kapandığında burada görünecektir.")
 
     time.sleep(10)
     st.rerun()
