@@ -51,7 +51,7 @@ VALID_INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h",
 AVAILABLE_COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "TAOUSDT", "AVAXUSDT"]
 AVAILABLE_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 GRID_COINS = ["BTCUSDT", "ETHUSDT"]
-HISTORY_QUERY_LIMIT = 500
+HISTORY_QUERY_LIMIT = 100
 HISTORY_MAX_DOCS = 1000
 
 # ══════════════════════════════════════════
@@ -954,6 +954,43 @@ def safe_render_dataframe(data_list, rename_map, desired_order=None):
 def get_engine_status():
     return {n: (_engine_threads.get(n) is not None and _engine_threads[n].is_alive()) for n in ['whale', 'ant', 'falcon']}
 
+# ══════════════════════════════════════════
+# 📦 UI VERİ CACHE — Firebase okumalarını azalt
+# History ve active trades UI'da cache'lenir,
+# sadece "Yenile" butonuna basınca güncellenir.
+# ══════════════════════════════════════════
+_ui_cache = {}
+_ui_cache_lock = threading.Lock()
+UI_CACHE_TTL = 300  # 5 dakika
+
+def get_cached_history():
+    """History'yi cache'den oku, TTL dolmuşsa Firebase'den yenile."""
+    now = time.time()
+    with _ui_cache_lock:
+        c = _ui_cache.get('history')
+        if c and (now - c['ts']) < UI_CACHE_TTL:
+            return c['data']
+    try:
+        docs = get_data_ref('history').order_by('time', direction=firestore.Query.DESCENDING).limit(HISTORY_QUERY_LIMIT).get()
+        data = [h.to_dict() for h in docs] if docs else []
+    except Exception as e:
+        logger.error(f"History okuma hatası: {e}")
+        with _ui_cache_lock:
+            c = _ui_cache.get('history')
+            return c['data'] if c else []
+
+    with _ui_cache_lock:
+        _ui_cache['history'] = {'data': data, 'ts': now}
+    return data
+
+def safe_firebase_read(read_func, fallback=None):
+    """Firebase okumasını try/except ile sar. Quota aşılırsa fallback döndür."""
+    try:
+        return read_func()
+    except Exception as e:
+        logger.error(f"Firebase read hatası: {e}")
+        return fallback
+
 def main():
     st.title("🛡️ QUANT OMNI V11 FINAL")
     st.caption("Fee-Aware • Daily Loss Limit • Momentum Check • Wick SL • Stale Timeout")
@@ -983,8 +1020,7 @@ def main():
     st.markdown(f"""<div class='fee-box'>💰 <b>Fee Modeli (taraf başı):</b> Trend %{fr_t*100:.2f} | Grid %{fr_g*100:.2f} | Flash %{fr_f*100:.2f} | 
     Günlük PnL: <b>${daily_pnl:.2f}</b> / Limit: <b>-${daily_limit:.2f}</b></div>""", unsafe_allow_html=True)
 
-    hist_docs = get_data_ref('history').order_by('time', direction=firestore.Query.DESCENDING).limit(HISTORY_QUERY_LIMIT).get()
-    all_history = [h.to_dict() for h in hist_docs] if hist_docs else []
+    all_history = get_cached_history()
 
     col_ref1, col_ref2 = st.columns([4, 1])
     with col_ref2:
@@ -1004,8 +1040,7 @@ def main():
 
         col1, col2 = st.columns([1, 2])
         with col1:
-            doc = get_data_ref('configs').document('trend').get()
-            cfg = doc.to_dict() if doc.exists else {}
+            cfg = get_cached_config('trend')
             with st.form("t_cfg"):
                 m = st.number_input("Marjin ($)", 10, 5000, safe_int(cfg.get('margin', 300), 300))
                 lev = st.slider("Kaldıraç", 1, 20, safe_int(cfg.get('leverage', 3), 3))
@@ -1051,7 +1086,7 @@ def main():
 
         with col2:
             st.markdown("#### `🟢 AKTİF İŞLEMLER`")
-            ads = get_data_ref('active_trades').get()
+            ads = safe_firebase_read(lambda: get_data_ref('active_trades').get(), [])
             tt = [a.to_dict() for a in ads if a.id.startswith('trend_')]
             if tt:
                 rn = {'symbol':'Varlık','type':'Yön','entry':'Giriş','tp':'TP','sl':'SL','margin':'Marjin($)','partial_done':'Partial'}
@@ -1070,8 +1105,8 @@ def main():
                 st.info("Açık işlem yok.")
 
             st.markdown("#### `📡 RADAR`")
-            sd = get_data_ref('states').document('trend_status').get()
-            if sd.exists:
+            sd = safe_firebase_read(lambda: get_data_ref('states').document('trend_status').get())
+            if sd and sd.exists:
                 sdata = sd.to_dict().get('data', {})
                 if sdata:
                     rl = []
@@ -1098,8 +1133,7 @@ def main():
 
         col1, col2 = st.columns([1, 2])
         with col1:
-            doc = get_data_ref('configs').document('grid').get()
-            cg = doc.to_dict() if doc.exists else {}
+            cg = get_cached_config('grid')
             with st.form("g_cfg"):
                 gc = st.selectbox("Coin", GRID_COINS, index=safe_selectbox_index(cg.get('coin','BTCUSDT'), GRID_COINS, 0))
                 sp = st.number_input("Spacing (%)", 0.1, 5.0, float(min(max(safe_float(cg.get('grid_spacing_pct', 0.5)), 0.1), 5.0)))
@@ -1135,8 +1169,8 @@ def main():
             max_risk = safe_int(cg.get('margin_per_grid',100)) * safe_int(cg.get('max_grids',50))
             st.markdown(f"""<div class='warn-box'><b>⚠️ Maks Risk:</b> ${max_risk:,.0f}</div>""", unsafe_allow_html=True)
 
-            state = get_data_ref('states').document('grid').get()
-            if state.exists:
+            state = safe_firebase_read(lambda: get_data_ref('states').document('grid').get())
+            if state and state.exists:
                 sd = state.to_dict()
                 if sd.get('circuit_breaker_active'):
                     st.markdown(f"""<div class='warn-box'><b>🚨 CIRCUIT BREAKER!</b> Düşüş: %{sd.get('drawdown_pct',0):.1f}</div>""", unsafe_allow_html=True)
@@ -1175,8 +1209,7 @@ def main():
 
         col1, col2 = st.columns([1, 2])
         with col1:
-            doc = get_data_ref('configs').document('flash').get()
-            cf = doc.to_dict() if doc.exists else {}
+            cf = get_cached_config('flash')
             with st.form("f_cfg"):
                 mf = st.number_input("Marjin ($)", 10, 5000, safe_int(cf.get('margin', 200), 200))
                 lf = st.slider("Kaldıraç", 1, 20, safe_int(cf.get('leverage', 5), 5))
@@ -1214,8 +1247,8 @@ def main():
                 st.success("Sıfırlandı!"); time.sleep(1); st.rerun()
 
         with col2:
-            af = get_data_ref('active_trades').document('flash_pos').get()
-            if af.exists:
+            af = safe_firebase_read(lambda: get_data_ref('active_trades').document('flash_pos').get())
+            if af and af.exists:
                 p = af.to_dict()
                 rn = {'symbol':'Varlık','type':'Yön','entry':'Giriş','tp':'TP','sl':'SL','margin':'Bütçe($)','quality_score':'Kalite','entry_rsi':'RSI'}
                 df = safe_render_dataframe([p], rn)
@@ -1227,15 +1260,15 @@ def main():
                 if ep > 0 and cs > ep:
                     st.markdown("""<div class='edge-box'><b>🔒 Trailing aktif — kayıpsız bölgede</b></div>""", unsafe_allow_html=True)
             else:
-                sig = get_data_ref('signals').document('flash').get()
-                if sig.exists:
+                sig = safe_firebase_read(lambda: get_data_ref('signals').document('flash').get())
+                if sig and sig.exists:
                     s = sig.to_dict()
                     st.warning(f"📡 SON: {s.get('symbol','?')} Δ%{s.get('change','?')} Q:{s.get('quality','?')}")
                 st.info("Momentum onaylı hedef bekleniyor...")
 
             st.markdown("#### `🕒 SOĞUMA`")
-            cd = get_data_ref('states').document('flash_cooldown').get()
-            if cd.exists:
+            cd = safe_firebase_read(lambda: get_data_ref('states').document('flash_cooldown').get())
+            if cd and cd.exists:
                 cds = cd.to_dict()
                 cl = []
                 now = datetime.now()
@@ -1309,8 +1342,8 @@ def main():
         st.markdown("### ⚙️ Risk Yönetimi")
         st.markdown("""<div class='info-box'><b>Günlük Kayıp Limiti:</b> Tüm botların bugünkü toplam net kaybı bu limiti aşarsa, sistem otomatik olarak tüm otopilotları durdurur. Yeni güne geçildiğinde sıfırlanır.</div>""", unsafe_allow_html=True)
 
-        risk_doc = get_data_ref('states').document('daily_risk').get()
-        risk_data = risk_doc.to_dict() if risk_doc.exists else {}
+        risk_doc = safe_firebase_read(lambda: get_data_ref('states').document('daily_risk').get())
+        risk_data = risk_doc.to_dict() if (risk_doc and risk_doc.exists) else {}
 
         with st.form("risk_cfg"):
             dl = st.number_input("Günlük Maks Kayıp ($)", 10, 1000, safe_int(risk_data.get('daily_limit', 100), 100))
